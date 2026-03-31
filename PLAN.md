@@ -1,7 +1,4 @@
-# AI Agent Harness 커리큘럼 (v5 CANONICAL)
-
-※ 이 번호가 최종 기준이다.
-※ 상세판 / 요약판 / 코드 전부 이 번호를 따른다.
+# AI Agent Harness 커리큘럼
 
 ---
 
@@ -88,9 +85,81 @@ agent-harness (Go CLI)
       → (verify) → 성공/실패
       → (retry or done)
 
+### 전역 Config 구조
+
+모든 챕터의 설정값은 단일 config 파일을 기준으로 한다. 각 챕터는 자신의 섹션만 추가한다.
+
+```yaml
+api:
+  key: ""                          # CH02
+  model: claude-sonnet-4-6         # CH02
+  max_tokens: 8192                 # CH02
+
+gate:
+  deny_paths: [go.mod, .github/**] # CH05
+  deny_ops: [delete, rename]       # CH05
+  on_violation: abort              # CH05
+
+context:
+  deny_context_paths: [.env, "*secret*", "*credential*"]  # CH04
+  max_tokens: 4096                 # CH04
+
+budget:
+  max_tokens: 0                    # CH13 (0 = 제한 없음)
+  on_exceed: abort                 # CH13
+```
+
+> 이 구조는 구현 없이 설계 기준으로만 존재한다.
+> 각 챕터에서 자신의 섹션을 구현할 때 이 스키마를 참조한다.
+> 설정값 위치가 분산되면 CH14 통합 시 충돌이 생기므로 이 파일이 유일한 anchor다.
+
+### 인터페이스 설계 원칙
+
+이 프로젝트 전체에서 반복되는 패턴을 CH01에서 미리 확립한다.
+
+**Go 인터페이스의 역할**
+
+인터페이스는 구현체를 교체 가능하게 만드는 유일한 수단이다. 테스트에서 Mock으로 교체하거나, 챕터 간 단계적 구현 교체(stub → 실제 구현)가 가능한 이유다. Go에서 인터페이스는 사용하는 쪽(caller)에서 정의한다.
+
+**이 프로젝트에서 인터페이스가 적용되는 위치**
+
+| 인터페이스 | 사용처 | 테스트 대체 | 운영 구현 | 챕터 |
+|---|---|---|---|---|
+| `HookRunner` | ApplyEngine | `NoopHook` | `PolicyHook` | CH06 stub → CH08 구현 |
+| `LLMClient` | Flow | `MockClient` | `APIClient` | CH02 구현 → CH14 주입 |
+| `Verifier` | Flow | `AlwaysPassVerifier` | `TestRunner` | CH07 구현 → CH14 주입 |
+| `ContextBuilder` | Flow | `FixedContextBuilder` | `RealContextBuilder` | CH04 구현 → CH14 주입 |
+
+**의존성 주입 패턴**
+
+```go
+// 인터페이스는 사용하는 쪽에서 정의
+type HookRunner interface {
+    Pre(ctx context.Context, plan Plan) error
+    Post(ctx context.Context, result ApplyResult) error
+}
+
+// ApplyEngine은 구현체를 모른다
+type ApplyEngine struct {
+    hook HookRunner
+}
+
+func NewApplyEngine(hook HookRunner) *ApplyEngine { ... }
+
+// 테스트: NoopHook 주입
+engine := NewApplyEngine(&NoopHook{})
+
+// 운영: PolicyHook 주입
+engine := NewApplyEngine(NewPolicyHook(cfg))
+```
+
+> 각 챕터에서 stub을 먼저 정의하고 나중에 교체하는 이유가 바로 이 패턴이다.
+> 인터페이스 없이 구체 타입을 직접 참조하면 교체 시 모든 호출부를 수정해야 한다.
+
 ### 완료 기준
 - 하네스 전체 구성요소 9개의 역할과 실행 순서를 설명할 수 있다
 - 각 컴포넌트가 어느 챕터에서 구현되는지 매핑할 수 있다
+- 인터페이스 설계 위치 테이블을 기준으로 각 컴포넌트의 교체 지점을 설명할 수 있다
 
 ---
 
@@ -104,12 +173,99 @@ agent-harness (Go CLI)
   2. config 파일 fallback
 - HTTP 레벨 에러 처리 (4xx / 5xx 분류)
 
+### context.Context 인터페이스 확립
+
+이 챕터에서 모든 함수의 첫 인자를 `ctx context.Context`로 고정한다.
+
+```go
+func (c *Client) Call(ctx context.Context, opt CallOption, prompt string) (Response, error)
+```
+
+이후 모든 챕터는 이 인터페이스를 그대로 따른다. 나중에 추가하면 CH02~CH13의 인터페이스를 전부 수정해야 하므로 여기서 확립한다.
+
+- `ctx`를 HTTP 요청에 전달 → 상위에서 cancel 시 요청 즉시 중단
+- CH08 abort: `cancel()` 호출로 전파
+- CH11 goroutine: 각 agent goroutine이 동일 ctx를 공유 → 하나가 실패하면 전체 취소 가능
+
 > BudgetTokens 슬롯을 처음부터 포함하는 이유:
 > CH13에서 retrofit하면 CallOption 구조 전체를 변경해야 하므로 슬롯만 먼저 확보.
+
+### 테스트 인프라 구축
+
+CH02부터 모든 챕터가 Mock LLM을 필요로 한다. 여기서 한 번 구축하고 이후 챕터에서 재사용한다.
+
+**Golden File 구조**
+
+```
+testdata/
+├── api/
+│   ├── simple_response.json          // 정상 단일 응답
+│   ├── 429_rate_limit.json           // Rate limit 에러
+│   ├── 500_server_error.json         // 서버 에러
+│   └── streaming/
+│       ├── chunk_01.json             // SSE 청크 (CH03용)
+│       └── chunk_02.json
+├── diffs/
+│   ├── valid_patch.diff              // 정상 unified diff (CH06용)
+│   └── malformed_patch.diff          // 깨진 diff
+└── plans/
+    └── safe_plan.md                  // 정상 plan (CH05용)
+```
+
+**Mock HTTP 서버 패턴**
+
+```go
+// 테스트마다 서버를 띄우고 URL을 Client에 주입
+func newMockServer(t *testing.T, fixture string) *httptest.Server {
+    t.Helper()
+    data, err := os.ReadFile(filepath.Join("testdata/api", fixture))
+    require.NoError(t, err)
+
+    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.Write(data)
+    }))
+    t.Cleanup(srv.Close)
+    return srv
+}
+
+// 사용
+srv := newMockServer(t, "simple_response.json")
+client := NewClient(WithBaseURL(srv.URL))
+```
+
+**호출 횟수 카운팅 (retry 검증용)**
+
+```go
+type countingHandler struct {
+    count    int
+    response []byte
+}
+
+func (h *countingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    h.count++
+    w.WriteHeader(http.StatusServiceUnavailable)
+    w.Write(h.response)
+}
+```
+
+**임시 디렉터리 규칙**
+
+- `t.TempDir()` 사용 — 테스트 종료 시 자동 정리
+- 테스트 간 파일 공유 금지 (각 테스트가 독립된 디렉터리 사용)
+- 실제 작업 디렉터리의 파일을 수정하는 테스트 작성 금지
+
+> 연결 끊김 시뮬레이션: `net.Pipe()`로 연결 후 즉시 close → `io.ErrUnexpectedEOF` 발생
+> 이 패턴은 CH03 스트리밍 중단 테스트에서 사용한다.
 
 ### 완료 기준
 - API key 로드 → 단일 요청 → 응답 수신까지 동작한다
 - 4xx / 5xx 에러를 구분해서 처리한다
+- 모든 공개 함수가 `ctx context.Context`를 첫 인자로 받는다
+- ctx가 cancel되면 진행 중인 HTTP 요청이 중단된다
+- Mock HTTP 서버가 fixture 파일을 응답으로 반환한다
+- 임시 디렉터리에서 파일 생성/수정이 테스트 종료 후 자동 정리된다
+- 호출 횟수 카운팅으로 retry 동작을 검증할 수 있다
 
 ---
 
@@ -265,11 +421,65 @@ LLM이 생성한 plan이 하네스 자체의 동작을 변경하려는 내용을
 Apply Engine이 pre/post hook 슬롯을 가지되, 실제 구현은 CH08에서 교체.
 CH06에서는 아무것도 하지 않는 NoopHook으로 연결.
 
+### 파일 시스템 원자성
+
+단순 백업(.bak) 방식은 apply 도중 crash 시 파일이 손상된 상태로 남는다.
+
+**왜 단순 백업이 불충분한가**
+
+```
+1) file.go 읽기
+2) file.go.bak 복사         ← crash → .bak만 남음
+3) 패치 적용 후 덮어쓰기      ← crash → file.go 반쯤 쓰인 상태
+4) 성공 → .bak 삭제
+```
+
+3번 중간에 crash가 나면 `file.go`는 복구 불가능한 상태가 된다.
+
+**Atomic Replace 패턴**
+
+```go
+func atomicWrite(path string, content []byte) error {
+    dir := filepath.Dir(path)
+    // 반드시 같은 파티션에 임시 파일 생성 (cross-device rename 방지)
+    tmp, err := os.CreateTemp(dir, ".tmp-*")
+    if err != nil {
+        return err
+    }
+    tmpPath := tmp.Name()
+
+    if _, err := tmp.Write(content); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+    if err := tmp.Close(); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+
+    // os.Rename은 POSIX에서 atomic
+    // 실패해도 원본 파일은 손상되지 않는다
+    return os.Rename(tmpPath, path)
+}
+```
+
+**Rollback 설계**
+
+- apply 전 원본 내용을 메모리에 보관 (파일이 작은 경우)
+- 파일이 큰 경우 임시 디렉터리에 스냅샷 저장 후 atomic write로 복원
+- `.bak` 파일을 작업 디렉터리에 남기지 않는다
+- rollback 자체도 atomic write를 사용한다
+
+> cross-device rename이 발생하면 os.Rename이 에러를 반환한다.
+> 임시 파일은 반드시 대상 파일과 동일한 파티션(같은 디렉터리)에 생성해야 한다.
+
 ### 완료 기준
 - unified diff 형식의 LLM 출력을 파싱해서 파일에 적용한다
 - AST syntax 검증 실패 시 apply를 거부한다
 - apply 실패 시 원본 파일로 rollback된다
 - NoopHook이 pre/post 슬롯에 연결되어 있다
+- 패치 적용 도중 에러가 발생해도 원본 파일이 손상되지 않는다
+- rollback 완료 후 임시 파일이 남지 않는다
 
 ---
 
@@ -387,9 +597,42 @@ Skill
 - tool execution은 하네스가 담당
 - credential: CH02의 API key 로드 패턴과 동일하게 통일
 
+### Tool 응답 신뢰 경계
+
+tool 응답은 LLM 출력과 동일한 신뢰 수준으로 처리한다. 외부 시스템이 악의적이거나 손상된 응답을 보낼 수 있다.
+
+- tool 응답도 CH03과 동일하게 스키마 검증 (허용 필드 외 unknown field 거부)
+- 응답 크기 상한 적용 (비정상적으로 큰 응답 차단)
+- 파싱 성공 ≠ 응답 신뢰
+
+### Tool 실행 옵션
+
+```go
+type ToolCallOption struct {
+    Timeout         time.Duration // 0 = 기본값 30s
+    MaxResponseSize int64         // 바이트 단위, 0 = 기본값 1MB
+    Idempotent      bool          // true = 실패 시 retry 허용
+}
+```
+
+- timeout 초과 시 context cancel → TRANSIENT 에러로 분류 (CH07 연결)
+- `Idempotent: false`인 tool은 retry 없이 즉시 PERMANENT 처리
+- 재시도 가능 여부는 tool 등록 시 명시
+
+### Tool 실행 격리
+
+- 파일 시스템 접근 tool은 CH05의 deny_paths 정책과 동일하게 적용
+- 쉘 명령 실행 tool은 allow-list 기반 허용만 (deny-by-default)
+- tool이 하네스 자신의 소스를 대상으로 접근하려 할 경우 거부 (CH05 Prompt Injection 방어와 동일 원칙)
+
 ### 완료 기준
 - tool 호출 요청을 받아 실행하고 결과를 반환한다
 - 외부 시스템 credential을 CH02와 동일한 방식으로 로드한다
+- tool 응답이 허용 스키마를 벗어나면 거부된다
+- tool 응답 크기가 상한을 초과하면 에러를 반환한다
+- tool 실행이 timeout을 초과하면 취소되고 TRANSIENT로 분류된다
+- 비멱등 tool은 실패 시 retry 없이 abort된다
+- 파일 시스템 접근 tool이 deny_paths를 준수한다
 
 ---
 
@@ -398,14 +641,58 @@ Skill
 - explorer / planner / implementer / verifier
 - 필요할 때만 사용
 
+### Agent Spawn: goroutine + channel
+
+각 agent를 goroutine으로 실행하고 결과를 channel로 수집한다.
+
+```go
+type AgentResult struct {
+    Role   string
+    Output any
+    Err    error
+}
+
+ch := make(chan AgentResult, len(agents))
+
+for _, agent := range agents {
+    go func(a Agent) {
+        out, err := a.Run(ctx, input)
+        ch <- AgentResult{Role: a.Role(), Output: out, Err: err}
+    }(agent)
+}
+
+// 결과 수집
+for range agents {
+    result := <-ch
+    // 처리
+}
+```
+
+- ctx는 CH02에서 확립한 인터페이스 그대로 전달 → 상위 cancel 시 모든 agent goroutine 종료
+- 하나의 agent 실패 시 `cancel()` 호출로 나머지 agent도 중단 가능
+- subprocess나 외부 프로세스 없이 Go 네이티브 패턴으로 구현
+
 ### 동시성 처리 (파일 단위 lock)
 
 여러 agent가 동시에 파일을 수정하는 경우 Apply Engine에 file lock 적용.
 path 기준 mutex를 획득하고 rollback은 lock 범위 안에서만 동작.
 
+```go
+type FileLockRegistry struct {
+    mu    sync.Mutex
+    locks map[string]*sync.Mutex
+}
+
+func (r *FileLockRegistry) Lock(path string) func() {
+    // path별 mutex 획득, unlock 함수 반환
+}
+```
+
 ### 완료 기준
 - 두 agent가 동일 파일을 동시에 수정하려 할 때 하나가 대기한다
 - 각 agent 역할(explorer / planner / implementer / verifier)이 분리되어 동작한다
+- 하나의 agent가 에러를 반환하면 나머지 agent가 ctx cancel로 중단된다
+- 모든 agent 결과가 수집된 후 다음 단계로 진행된다
 
 ---
 
@@ -433,10 +720,73 @@ CH02에서 확보한 BudgetTokens 슬롯에 실제 로직 추가.
 - retry 제한
 - 모델 분리
 
+### Rate Limiting
+
+retry/backoff(CH03)는 에러 발생 후의 대응이다. Rate limiting은 에러 발생 전 속도 제어다. 두 레이어는 독립적으로 동작한다.
+
+**두 가지 Rate Limit 구분**
+
+| 종류 | 단위 | 제어 방법 | 설정 키 |
+|---|---|---|---|
+| Request/min | 요청 횟수 | token bucket | `budget.max_rpm` |
+| Token/min | 입출력 토큰 합 | sliding window | `budget.max_tpm` |
+
+config 추가:
+
+```yaml
+budget:
+  max_tokens: 0       # CH13 (0 = 제한 없음)
+  on_exceed: abort    # CH13
+  max_rpm: 0          # 분당 최대 요청 수 (0 = 제한 없음)
+  max_tpm: 0          # 분당 최대 토큰 수 (0 = 제한 없음)
+```
+
+**Token Bucket 구현**
+
+```go
+type RateLimiter struct {
+    mu         sync.Mutex
+    tokens     float64
+    maxTokens  float64
+    refillRate float64 // tokens/sec
+    lastRefill time.Time
+}
+
+func (r *RateLimiter) Wait(ctx context.Context) error {
+    for {
+        r.mu.Lock()
+        r.refill()
+        if r.tokens >= 1 {
+            r.tokens--
+            r.mu.Unlock()
+            return nil
+        }
+        wait := time.Duration((1-r.tokens)/r.refillRate * float64(time.Second))
+        r.mu.Unlock()
+
+        select {
+        case <-ctx.Done():
+            return ctx.Err() // ctx cancel 시 즉시 반환
+        case <-time.After(wait):
+        }
+    }
+}
+```
+
+API client 호출 전 `limiter.Wait(ctx)` 호출.
+
+**429 응답 처리와의 연계**
+
+- 429 수신 → `Retry-After` 헤더 파싱 → rate limiter의 refillRate를 해당 기간 동안 0으로 설정
+- 이후 요청들이 자동으로 대기 (CH03 backoff와 이중 보호)
+
 ### 완료 기준
 - BudgetTokens 초과 시 설정된 정책(abort / 축소)이 동작한다
 - 저비용 모델과 고성능 모델이 작업 유형에 따라 분리 호출된다
 - cache hit 시 API 호출이 발생하지 않는다
+- 설정된 RPM 초과 시 요청이 대기한다
+- 대기 중 ctx cancel 시 즉시 에러를 반환한다
+- 429 수신 시 Retry-After 기간 동안 rate limiter가 일시적으로 중단된다
 
 ---
 
@@ -475,12 +825,74 @@ agent-harness apply --plan plan.md    // 기존 plan 적용
 > CLI는 Flow orchestrator의 얇은 래퍼다.
 > 비즈니스 로직이 CLI 레이어에 들어오지 않도록 Flow가 모든 결정을 담당한다.
 
+### Graceful Shutdown
+
+CH02에서 확립한 `context.Context` + cancel 패턴을 OS 신호와 연결한다.
+
+**신호 수신 → cancel 전파 흐름**
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+sigCh := make(chan os.Signal, 1)
+signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+go func() {
+    <-sigCh
+    cancel() // 전체 파이프라인에 전파
+}()
+
+err := flow.Run(ctx, request)
+```
+
+**각 단계별 중단 시점**
+
+| 단계 | 중단 가능 여부 | 중단 시 동작 |
+|---|---|---|
+| Context 구성 | 즉시 가능 | 파일 읽기 중단, 상태 없음 |
+| Plan 생성 | 즉시 가능 | 진행 중인 API 요청 취소 |
+| Apply 실행 | **불가** | rollback 완료 후 종료 |
+| Verify 실행 | 가능 | 실행 중인 프로세스 kill 후 종료 |
+
+**Apply 중 Shutdown 처리**
+
+Apply가 시작되면 context cancel을 무시하고 완료 또는 rollback까지 진행한다.
+
+```go
+// Apply는 부모 ctx가 cancel되어도 계속 실행
+applyCtx := context.WithoutCancel(ctx) // Go 1.21+
+
+err := applyEngine.Apply(applyCtx, patch)
+if err != nil {
+    // rollback은 반드시 완료 — Background context 사용
+    _ = applyEngine.Rollback(context.Background())
+}
+
+// Apply 완료 후 부모 ctx 상태 확인
+if ctx.Err() != nil {
+    return ctx.Err() // 지연된 종료
+}
+```
+
+**exit code 규칙**
+
+| 상황 | exit code |
+|---|---|
+| 정상 완료 | 0 |
+| 실행 실패 (apply 에러 등) | 1 |
+| 설정 오류 | 2 |
+| 신호 종료 (SIGINT/SIGTERM) | 130 |
+
 ### 완료 기준
 - 사용자 요청 하나로 context 구성 → plan → gate → apply → verify 전 흐름이 단일 실행된다
 - 각 단계 실패 시 정의된 정책(retry / abort / rollback)이 동작한다
 - observability가 전 흐름에 걸쳐 기록된다
 - `run` / `plan` / `apply` 서브커맨드가 동작한다
 - `--dry-run` 플래그로 apply 없이 plan까지만 실행된다
+- SIGTERM 수신 시 진행 중인 API 요청이 취소된다
+- Apply 중 SIGTERM 수신 시 Apply가 완료(또는 rollback)된 후 종료된다
+- exit code가 정상 종료(0)와 신호 종료(130)를 구분한다
 
 ---
 
@@ -522,8 +934,14 @@ agent-harness apply --plan plan.md    // 기존 plan 적용
 - CallOption.BudgetTokens는 CH02에서 구조 정의, CH13에서 로직 (고정)
 - Plan Gate 정책은 외부 설정 파일로 분리 (고정)
 - Apply Engine = unified diff + AST 검증 전용 (고정)
+- Apply Engine = atomic write 기반 rollback (고정)
 - Hook 인터페이스는 CH06에서 stub 정의, CH08에서 구현 (고정)
 - Plan = CH05 (고정)
 - Apply = CH06 (고정)
 - Verify = CH07 (고정)
 - Flow orchestrator = CH14 (고정)
+- 인터페이스 설계 원칙은 CH01에서 확립, 전 챕터에서 적용 (고정)
+- 테스트 인프라(Mock 서버, Golden File)는 CH02에서 구축, 전 챕터에서 재사용 (고정)
+- Rate Limiting = CH13 (고정, budget 섹션과 통합)
+- Graceful Shutdown = CH14 (고정, Flow 완성과 동시 구현)
+- Tool 응답 신뢰 경계 = CH10 (고정, CH03 LLM 출력 신뢰 경계와 동일 원칙)
