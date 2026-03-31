@@ -156,6 +156,48 @@ engine := NewApplyEngine(NewPolicyHook(cfg))
 > 각 챕터에서 stub을 먼저 정의하고 나중에 교체하는 이유가 바로 이 패턴이다.
 > 인터페이스 없이 구체 타입을 직접 참조하면 교체 시 모든 호출부를 수정해야 한다.
 
+### 에러 타입 설계 원칙
+
+이 프로젝트에서 에러는 caller가 분기할 수 있도록 구조화한다. 에러 분류(TRANSIENT / PERMANENT / SYNTAX)가 CH03, CH07, CH10에 걸쳐 사용되므로 CH01에서 공통 타입을 확립한다.
+
+```go
+type ErrorClass string
+
+const (
+    ErrorClassTransient ErrorClass = "TRANSIENT" // 재시도 가능
+    ErrorClassPermanent ErrorClass = "PERMANENT" // 즉시 abort
+    ErrorClassSyntax    ErrorClass = "SYNTAX"    // retry + hint 추가
+)
+
+type HarnessError struct {
+    Class   ErrorClass
+    Stage   string // "parse", "apply", "verify" 등
+    Wrapped error
+}
+
+func (e *HarnessError) Error() string {
+    return fmt.Sprintf("[%s/%s] %v", e.Stage, e.Class, e.Wrapped)
+}
+func (e *HarnessError) Unwrap() error { return e.Wrapped }
+```
+
+**에러 분류 확인은 `errors.As` 사용**
+
+```go
+var he *HarnessError
+if errors.As(err, &he) && he.Class == ErrorClassTransient {
+    // retry
+}
+```
+
+**규칙**
+- sentinel error는 단순 상태 표현(EOF 등)에만 사용, 분기가 필요한 에러는 `HarnessError`로 래핑
+- 에러 래핑 시 `fmt.Errorf("...: %w", err)` 사용 — `errors.Is` / `errors.As` 체인 유지
+- 에러를 새로 생성하는 위치(발생 지점)에서만 `HarnessError`를 생성, 상위 레이어는 그대로 전파
+
+> 이 타입은 CH03(에러 분류), CH07(상태 전이 조건), CH10(tool 응답 처리)에서 공통으로 사용한다.
+> 각 챕터에서 별도 에러 타입을 정의하면 CH14 통합 시 분류 로직이 중복된다.
+
 ### Config 로드 및 검증 패턴
 
 모든 챕터의 설정값은 단일 Config 구조체를 통해 로드된다. 각 챕터는 자신의 섹션에 `Validate()` 메서드를 추가하는 방식으로 검증 책임을 분산한다.
@@ -317,14 +359,15 @@ func (h *countingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ## CH03. Parsing + 호출 안정화
 
-- retry / backoff
-- 에러 분류 (transient / permanent)
-- structured output
-- fallback parsing
-- markdown strip
-- JSON fragment 추출
+### Part 1. 응답 파싱 + 신뢰 경계
 
-### 스트리밍 응답 처리
+"LLM 출력을 어떻게 읽는가"에 집중한다.
+
+- structured output 파싱
+- fallback parsing (markdown strip, JSON fragment 추출)
+- LLM 출력 신뢰 경계
+
+#### 스트리밍 응답 처리
 
 - SSE(Server-Sent Events) 청크 수신 루프
 - 청크 단위 누적 파싱 (부분 JSON 조립)
@@ -334,7 +377,7 @@ func (h *countingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 > 스트리밍 청크는 결국 "불완전한 응답을 어떻게 파싱하는가" 문제이므로 파싱 챕터에서 다룬다.
 > API 연결(CH02)은 연결 자체에 집중하고, 응답을 어떻게 소비하는지는 여기서 결정한다.
 
-### LLM 출력 신뢰 경계
+#### LLM 출력 신뢰 경계
 
 LLM이 생성한 diff/JSON을 그대로 실행하면 안 된다.
 
@@ -349,13 +392,39 @@ LLM이 생성한 diff/JSON을 그대로 실행하면 안 된다.
 > API 연결 자체와 응답 처리는 독립적인 관심사다.
 > CH02에서 둘을 묶으면 첫 동작 확인 전에 parsing 설계까지 결정해야 하는 부담이 생긴다.
 
-### 완료 기준
-- retry/backoff가 transient 에러에서만 동작한다
+#### 완료 기준 (Part 1)
 - LLM이 markdown 코드 블록으로 감싼 JSON을 올바르게 추출한다
 - structured output 파싱 실패 시 fallback이 동작한다
 - 스트리밍 응답을 청크 단위로 누적해 완성된 출력을 반환한다
 - 스트리밍 중단 시 이미 수신한 청크를 기준으로 에러를 반환한다
 - 허용 스키마 외 필드가 포함된 LLM 출력을 거부한다
+
+---
+
+### Part 2. 호출 안정화
+
+"API 연결을 어떻게 안정화하는가"에 집중한다.
+
+- retry / backoff
+- 에러 분류 (transient / permanent / syntax) → CH01의 `HarnessError` 사용
+- 429 Retry-After 파싱 및 대기
+
+#### 에러 분류 기준
+
+| ErrorClass | 조건 예시 | 동작 |
+|---|---|---|
+| TRANSIENT | connection refused, timeout, 5xx | retry |
+| SYNTAX | 파싱 실패, 스키마 불일치 | retry + hint 추가 |
+| PERMANENT | 4xx (401/403), 요청 구조 오류 | abort |
+
+> CH01에서 정의한 `HarnessError`를 그대로 사용한다.
+> 이 챕터에서 새 에러 타입을 정의하지 않는다.
+
+#### 완료 기준 (Part 2)
+- retry/backoff가 TRANSIENT 에러에서만 동작한다
+- PERMANENT 에러에서 retry 없이 즉시 에러를 반환한다
+- 429 수신 시 Retry-After 헤더에 명시된 시간만큼 대기 후 재시도한다
+- 에러가 `HarnessError`로 래핑되어 Stage와 Class가 포함된다
 
 ---
 
@@ -714,69 +783,6 @@ type ToolCallOption struct {
 
 ---
 
-## CH11. Multi-Agent
-
-> **의존 관계**: CH11은 CH14의 Flow를 전제로 한다. CH14 완성 후 이 챕터로 돌아오거나, CH14 직후에 학습하는 것을 권장한다.
-> 각 agent는 CH14 Flow의 특정 단계만 실행하는 방식으로 분리된다.
-
-- explorer / planner / implementer / verifier
-- 필요할 때만 사용
-
-### Agent Spawn: goroutine + channel
-
-각 agent를 goroutine으로 실행하고 결과를 channel로 수집한다.
-
-```go
-type AgentResult struct {
-    Role   string
-    Output any
-    Err    error
-}
-
-ch := make(chan AgentResult, len(agents))
-
-for _, agent := range agents {
-    go func(a Agent) {
-        out, err := a.Run(ctx, input)
-        ch <- AgentResult{Role: a.Role(), Output: out, Err: err}
-    }(agent)
-}
-
-// 결과 수집
-for range agents {
-    result := <-ch
-    // 처리
-}
-```
-
-- ctx는 CH02에서 확립한 인터페이스 그대로 전달 → 상위 cancel 시 모든 agent goroutine 종료
-- 하나의 agent 실패 시 `cancel()` 호출로 나머지 agent도 중단 가능
-- subprocess나 외부 프로세스 없이 Go 네이티브 패턴으로 구현
-
-### 동시성 처리 (파일 단위 lock)
-
-여러 agent가 동시에 파일을 수정하는 경우 Apply Engine에 file lock 적용.
-path 기준 mutex를 획득하고 rollback은 lock 범위 안에서만 동작.
-
-```go
-type FileLockRegistry struct {
-    mu    sync.Mutex
-    locks map[string]*sync.Mutex
-}
-
-func (r *FileLockRegistry) Lock(path string) func() {
-    // path별 mutex 획득, unlock 함수 반환
-}
-```
-
-### 완료 기준
-- 두 agent가 동일 파일을 동시에 수정하려 할 때 하나가 대기한다
-- 각 agent 역할(explorer / planner / implementer / verifier)이 분리되어 동작한다
-- 하나의 agent가 에러를 반환하면 나머지 agent가 ctx cancel로 중단된다
-- 모든 agent 결과가 수집된 후 다음 단계로 진행된다
-
----
-
 ## CH12. Observability
 
 - stage timing
@@ -1056,16 +1062,126 @@ if ctx.Err() != nil {
 
 ---
 
-## CH15. 확장
+## CH11. Multi-Agent
 
-- PR 자동화
-- 리뷰 루프
-- 팀 정책
-- skill registry
+> **의존 관계**: CH14 Flow 완성 후 진행한다. 각 agent는 CH14 Flow의 특정 단계만 실행하는 방식으로 분리된다.
+
+- explorer / planner / implementer / verifier
+- 필요할 때만 사용
+
+### Agent Spawn: goroutine + channel
+
+각 agent를 goroutine으로 실행하고 결과를 channel로 수집한다.
+
+```go
+type AgentResult struct {
+    Role   string
+    Output any
+    Err    error
+}
+
+ch := make(chan AgentResult, len(agents))
+
+for _, agent := range agents {
+    go func(a Agent) {
+        out, err := a.Run(ctx, input)
+        ch <- AgentResult{Role: a.Role(), Output: out, Err: err}
+    }(agent)
+}
+
+// 결과 수집
+for range agents {
+    result := <-ch
+    // 처리
+}
+```
+
+- ctx는 CH02에서 확립한 인터페이스 그대로 전달 → 상위 cancel 시 모든 agent goroutine 종료
+- 하나의 agent 실패 시 `cancel()` 호출로 나머지 agent도 중단 가능
+- subprocess나 외부 프로세스 없이 Go 네이티브 패턴으로 구현
+
+### 동시성 처리 (파일 단위 lock)
+
+여러 agent가 동시에 파일을 수정하는 경우 Apply Engine에 file lock 적용.
+path 기준 mutex를 획득하고 rollback은 lock 범위 안에서만 동작.
+
+```go
+type FileLockRegistry struct {
+    mu    sync.Mutex
+    locks map[string]*sync.Mutex
+}
+
+func (r *FileLockRegistry) Lock(path string) func() {
+    // path별 mutex 획득, unlock 함수 반환
+}
+```
 
 ### 완료 기준
-- skill registry에 skill을 등록하고 조회할 수 있다
-- PR 자동화 흐름이 CH14 orchestrator와 연결된다
+- 두 agent가 동일 파일을 동시에 수정하려 할 때 하나가 대기한다
+- 각 agent 역할(explorer / planner / implementer / verifier)이 분리되어 동작한다
+- 하나의 agent가 에러를 반환하면 나머지 agent가 ctx cancel로 중단된다
+- 모든 agent 결과가 수집된 후 다음 단계로 진행된다
+
+---
+
+## CH15. 확장
+
+### Skill Registry 완성 (CH09 연결)
+
+CH09에서 정의한 단일 Skill 실행 계약을 registry로 운영한다.
+
+- 등록: `registry.Register(skill)` — 중복 시 패닉
+- 조회: `registry.Get(name)` — 없으면 에러 반환
+- 목록: `registry.List()` — 등록된 전체 skill 이름 반환
+- Flow(CH14)에서 `StepTypeSkill` step 실행 시 registry 경유
+
+### PR 자동화
+
+Verify 성공 후 변경 사항을 자동으로 PR로 제출한다.
+
+```
+[Verify 성공]
+      │
+      ▼
+[git diff → branch 커밋]
+      │
+      ▼
+[GitHub API → PR 생성]
+      │
+      ▼
+[PR URL → Observability(CH12) 기록]
+```
+
+- credential 로드: CH02의 API key 로드 패턴과 동일 (`GITHUB_TOKEN` 환경변수 우선)
+- PR 생성 실패는 PERMANENT 에러로 분류 (CH01 `HarnessError` 사용)
+- `--dry-run` 플래그 시 PR 생성 없이 diff만 출력
+
+### 리뷰 루프
+
+PR 리뷰 코멘트를 새 요청으로 재입력해 수정 → PR 업데이트 사이클을 구성한다.
+
+```
+[PR 리뷰 코멘트 수신]
+      │
+      ▼
+[코멘트 → 새 요청으로 변환]
+      │
+      ▼
+[Flow(CH14) 재실행]
+      │
+      ▼
+[Verify 성공 → PR 업데이트]
+```
+
+- 코멘트 파싱: GitHub API로 미해결 코멘트만 수집
+- 코멘트가 없으면 루프 종료
+
+### 완료 기준
+- skill registry에 skill을 등록하고 CH14 Flow에서 step으로 실행된다
+- 존재하지 않는 skill 이름 조회 시 에러를 반환한다
+- Verify 성공 후 자동으로 PR이 생성되고 URL이 기록된다
+- 리뷰 코멘트를 입력으로 받아 수정 → PR 업데이트 사이클이 동작한다
+- `--dry-run` 플래그 시 PR 생성 없이 diff만 출력된다
 
 ---
 
@@ -1082,9 +1198,10 @@ if ctx.Err() != nil {
 7. 위험 실행 → CH08
 8. 반복 작업 → CH09
 9. 외부 연결 → CH10
-10. 복잡도 증가 → CH11
-11. 상태 안 보임 → CH12
-12. 비용 터짐 → CH13
+10. 상태 안 보임 → CH12
+11. 비용 터짐 → CH13
+12. 전체 통합 → CH14
+13. 복잡도 증가 → CH11 (CH14 이후, Flow 완성 후 진행)
 
 ---
 
