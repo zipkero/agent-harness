@@ -943,6 +943,185 @@ type Skill struct {
 
 > `Idempotent: false` skill이 실패하면 CH10의 비멱등 tool 처리와 동일하게 PERMANENT 처리한다.
 
+### 샘플 Skill 구현
+
+CH09에서 실제로 구현하는 skill 2개. 인터페이스 설계를 검증하고 테스트 작성 대상으로 사용한다.
+
+#### Skill 1: `file.read` — 파일 내용 읽기 (멱등)
+
+파일 경로를 받아 내용을 반환한다. LLM이 특정 파일을 Context 없이 직접 읽어야 할 때 사용한다.
+
+```go
+var FileReadSkill = Skill{
+    Name:       "file.read",
+    Idempotent: true,
+    Input: Schema{
+        "path": {Type: "string", Required: true}, // 읽을 파일 경로
+    },
+    Output: Schema{
+        "content": {Type: "string"}, // 파일 내용
+        "size":    {Type: "int"},    // 바이트 크기
+    },
+    Execute: func(input Input) (Output, error) {
+        path, _ := input["path"].(string)
+        data, err := os.ReadFile(path)
+        if err != nil {
+            return nil, &HarnessError{
+                Class:   ErrorClassPermanent, // 파일 없음 = 재시도 불가
+                Stage:   "skill/file.read",
+                Wrapped: err,
+            }
+        }
+        return Output{"content": string(data), "size": len(data)}, nil
+    },
+}
+```
+
+**이 skill이 보여주는 것**
+- Input 스키마 검증: `path` 없이 호출 시 Execute 전에 `SkillValidationError` 반환
+- 에러 분류: `os.ReadFile` 실패는 PERMANENT (파일 경로 오류는 retry로 해결 불가)
+- 멱등성: 동일 경로로 두 번 호출해도 파일 상태 변화 없음
+
+**테스트 케이스**
+```go
+// 정상: 존재하는 파일
+func TestFileReadSkill_HappyPath(t *testing.T) {
+    dir := t.TempDir()
+    path := filepath.Join(dir, "hello.txt")
+    os.WriteFile(path, []byte("hello"), 0644)
+
+    out, err := FileReadSkill.Execute(Input{"path": path})
+    require.NoError(t, err)
+    assert.Equal(t, "hello", out["content"])
+    assert.Equal(t, 5, out["size"])
+}
+
+// 실패: 존재하지 않는 파일 → PERMANENT 에러
+func TestFileReadSkill_NotFound(t *testing.T) {
+    _, err := FileReadSkill.Execute(Input{"path": "/nonexistent/file.txt"})
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+
+// Input 검증: path 누락 → Execute 전에 SkillValidationError
+func TestFileReadSkill_MissingInput(t *testing.T) {
+    err := registry.Execute("file.read", Input{}) // path 없음
+    var ve *SkillValidationError
+    require.ErrorAs(t, err, &ve)
+    assert.Equal(t, "path", ve.Field)
+}
+```
+
+---
+
+#### Skill 2: `shell.run` — 쉘 명령 실행 (비멱등)
+
+allow-list에 등록된 명령만 실행한다. `go test`, `go vet` 등 Verify 단계 전 사전 검사나 빌드 자동화에 사용한다.
+
+```go
+var ShellRunSkill = Skill{
+    Name:       "shell.run",
+    Idempotent: false, // 같은 명령을 두 번 실행하면 사이드 이펙트 발생 가능
+    Input: Schema{
+        "command": {Type: "string", Required: true}, // 실행할 명령 (공백 구분)
+        "dir":     {Type: "string", Required: true}, // 작업 디렉터리
+    },
+    Output: Schema{
+        "stdout":   {Type: "string"},
+        "stderr":   {Type: "string"},
+        "exit_code":{Type: "int"},
+    },
+    Execute: func(input Input) (Output, error) {
+        raw, _ := input["command"].(string)
+        dir, _ := input["dir"].(string)
+
+        parts := strings.Fields(raw)
+        if !isAllowed(parts[0]) { // allow-list 검사
+            return nil, &HarnessError{
+                Class:   ErrorClassPermanent,
+                Stage:   "skill/shell.run",
+                Wrapped: fmt.Errorf("command not allowed: %s", parts[0]),
+            }
+        }
+
+        cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
+        cmd.Dir = dir
+        var stdout, stderr bytes.Buffer
+        cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+        err := cmd.Run()
+        exitCode := 0
+        if err != nil {
+            var exitErr *exec.ExitError
+            if errors.As(err, &exitErr) {
+                exitCode = exitErr.ExitCode()
+                // 프로세스 종료 자체는 에러가 아님 — exit code로 판단
+                return Output{
+                    "stdout": stdout.String(), "stderr": stderr.String(),
+                    "exit_code": exitCode,
+                }, nil
+            }
+            // exec 자체 실패 (명령 없음, 권한 등) → PERMANENT
+            return nil, &HarnessError{Class: ErrorClassPermanent, Stage: "skill/shell.run", Wrapped: err}
+        }
+        return Output{"stdout": stdout.String(), "stderr": stderr.String(), "exit_code": 0}, nil
+    },
+}
+
+// allow-list: 하드코드 + config deny-by-default
+var allowedCommands = map[string]bool{
+    "go":   true,
+    "make": true,
+}
+
+func isAllowed(cmd string) bool { return allowedCommands[cmd] }
+```
+
+**이 skill이 보여주는 것**
+- `Idempotent: false` 실패 시 retry 없이 abort되는 경로 검증 가능
+- allow-list 기반 보안: CH10의 쉘 명령 실행 tool과 동일 원칙을 skill 레벨에서 먼저 구현
+- exit code와 exec 에러를 구분하는 패턴 (exit code 1은 에러가 아닐 수 있다)
+
+**테스트 케이스**
+```go
+// 정상: 허용된 명령
+func TestShellRunSkill_Allowed(t *testing.T) {
+    out, err := ShellRunSkill.Execute(Input{
+        "command": "go version",
+        "dir":     t.TempDir(),
+    })
+    require.NoError(t, err)
+    assert.Equal(t, 0, out["exit_code"])
+}
+
+// 보안: allow-list 외 명령 → PERMANENT
+func TestShellRunSkill_Blocked(t *testing.T) {
+    _, err := ShellRunSkill.Execute(Input{
+        "command": "curl http://example.com",
+        "dir":     t.TempDir(),
+    })
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+
+// 비멱등: Idempotent=false skill 실패 시 registry가 retry 없이 abort
+func TestShellRunSkill_NonIdempotentAbort(t *testing.T) {
+    // registry.Execute가 Idempotent=false skill의 실패를 PERMANENT로 분류하는지 검증
+    err := registry.Execute("shell.run", Input{"command": "go build ./...", "dir": "/nonexistent"})
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+```
+
+---
+
+> 두 skill은 인터페이스 설계를 검증하기 위한 최소 구현이다.
+> 실제 유용한 skill (예: `git.commit`, `file.glob`, `json.query`)은 CH15 확장 단계에서 추가한다.
+> 이 챕터에서는 `file.read`(멱등 + PERMANENT 에러)와 `shell.run`(비멱등 + allow-list)으로 두 가지 설계 경로를 모두 검증하는 것이 목표다.
+
 ### 완료 기준
 - skill을 정의하고 이름으로 registry에 등록할 수 있다
 - 존재하지 않는 이름으로 조회 시 에러를 반환한다
@@ -953,6 +1132,9 @@ type Skill struct {
 - `Idempotent: false` skill이 실패하면 retry 없이 abort된다
 - plan step의 type이 `skill`이면 LLM 호출 없이 registry에서 직접 실행된다
 - skill step 실행이 observability(CH11)에 별도 stage로 기록된다
+- `file.read` skill이 존재하지 않는 파일 경로에 대해 PERMANENT 에러를 반환한다
+- `shell.run` skill이 allow-list 외 명령을 PERMANENT 에러로 차단한다
+- `Idempotent: false`인 `shell.run` skill 실패 시 registry가 retry 없이 abort한다
 
 ---
 
