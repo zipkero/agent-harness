@@ -12,14 +12,14 @@ agent-harness (Go CLI)
 | 컴포넌트 | 담당 챕터 | 역할 |
 |---|---|---|
 | Context | CH04 | context 구성 및 압축 |
-| Flow | CH14 | plan → apply → verify 실행 흐름 orchestrator |
+| Flow | CH13 | plan → apply → verify 실행 흐름 orchestrator |
 | Control | CH08 | abort / pause / override 정책 |
 | Verify | CH07 | 검증 및 상태 전이 |
 | Retry | CH07 | error 분류 및 재시도 |
-| Cost | CH02(구조) + CH13(로직) | token budget, 모델 분리 |
+| Cost | CH02(구조) + CH12(로직) | token budget, 모델 분리 |
 | Parse | CH03 | 응답 파싱 |
 | Plan Gate | CH05 | 실행 전 검증 및 위험 필터 |
-| Observability | CH12 | 상태 추적 및 로깅 |
+| Observability | CH11 | 상태 추적 및 로깅 |
 
 ---
 
@@ -105,13 +105,13 @@ context:
   max_tokens: 4096                 # CH04
 
 budget:
-  max_tokens: 0                    # CH13 (0 = 제한 없음)
-  on_exceed: abort                 # CH13
+  max_tokens: 0                    # CH12 (0 = 제한 없음)
+  on_exceed: abort                 # CH12
 ```
 
 > 이 구조는 구현 없이 설계 기준으로만 존재한다.
 > 각 챕터에서 자신의 섹션을 구현할 때 이 스키마를 참조한다.
-> 설정값 위치가 분산되면 CH14 통합 시 충돌이 생기므로 이 파일이 유일한 anchor다.
+> 설정값 위치가 분산되면 CH13 통합 시 충돌이 생기므로 이 파일이 유일한 anchor다.
 
 ### 인터페이스 설계 원칙
 
@@ -126,9 +126,9 @@ budget:
 | 인터페이스 | 사용처 | 테스트 대체 | 운영 구현 | 챕터 |
 |---|---|---|---|---|
 | `HookRunner` | ApplyEngine | `NoopHook` | `PolicyHook` | CH06 stub → CH08 구현 |
-| `LLMClient` | Flow | `MockClient` | `APIClient` | CH02 구현 → CH14 주입 |
-| `Verifier` | Flow | `AlwaysPassVerifier` | `TestRunner` | CH07 구현 → CH14 주입 |
-| `ContextBuilder` | Flow | `FixedContextBuilder` | `RealContextBuilder` | CH04 구현 → CH14 주입 |
+| `LLMClient` | Flow | `MockClient` | `APIClient` | CH02 구현 → CH13 주입 |
+| `Verifier` | Flow | `AlwaysPassVerifier` | `TestRunner` | CH07 구현 → CH13 주입 |
+| `ContextBuilder` | Flow | `FixedContextBuilder` | `RealContextBuilder` | CH04 구현 → CH13 주입 |
 
 **의존성 주입 패턴**
 
@@ -196,7 +196,7 @@ if errors.As(err, &he) && he.Class == ErrorClassTransient {
 - 에러를 새로 생성하는 위치(발생 지점)에서만 `HarnessError`를 생성, 상위 레이어는 그대로 전파
 
 > 이 타입은 CH03(에러 분류), CH07(상태 전이 조건), CH10(tool 응답 처리)에서 공통으로 사용한다.
-> 각 챕터에서 별도 에러 타입을 정의하면 CH14 통합 시 분류 로직이 중복된다.
+> 각 챕터에서 별도 에러 타입을 정의하면 CH13 통합 시 분류 로직이 중복된다.
 
 ### Config 로드 및 검증 패턴
 
@@ -240,7 +240,7 @@ func (c APIConfig) Validate() error {
 ```
 
 > 각 챕터는 자신의 config 섹션이 추가될 때 `Validate()` 메서드를 함께 구현한다.
-> 이 패턴을 CH01에서 확립하지 않으면 CH14 통합 시 검증 로직이 분산되거나 누락된다.
+> 이 패턴을 CH01에서 확립하지 않으면 CH13 통합 시 검증 로직이 분산되거나 누락된다.
 
 ### 완료 기준
 - 하네스 전체 구성요소 9개의 역할과 실행 순서를 설명할 수 있다
@@ -255,7 +255,7 @@ func (c APIConfig) Validate() error {
 
 - API 요청 / 응답 구조
 - CallOption 설계 (Model, MaxTokens, BudgetTokens, CacheControl)
-  - BudgetTokens는 기본값 0 = 제한 없음, CH13에서 로직 채움
+  - BudgetTokens는 기본값 0 = 제한 없음, CH12에서 로직 채움
 - API Key 로드 순서
   1. 환경변수 우선
   2. config 파일 fallback
@@ -273,10 +273,10 @@ func (c *Client) Call(ctx context.Context, opt CallOption, prompt string) (Respo
 
 - `ctx`를 HTTP 요청에 전달 → 상위에서 cancel 시 요청 즉시 중단
 - CH08 abort: `cancel()` 호출로 전파
-- CH15 goroutine: 각 agent goroutine이 동일 ctx를 공유 → 하나가 실패하면 전체 취소 가능
+- CH14 goroutine: 각 agent goroutine이 동일 ctx를 공유 → 하나가 실패하면 전체 취소 가능
 
 > BudgetTokens 슬롯을 처음부터 포함하는 이유:
-> CH13에서 retrofit하면 CallOption 구조 전체를 변경해야 하므로 슬롯만 먼저 확보.
+> CH12에서 retrofit하면 CallOption 구조 전체를 변경해야 하므로 슬롯만 먼저 확보.
 
 ### 테스트 인프라 구축
 
@@ -472,12 +472,43 @@ Context에 포함되는 파일이 민감 정보를 담고 있을 수 있다.
 > Context가 LLM에 전송되는 순간 외부로 나간다.
 > 파일 선택 단계가 마지막 방어선이다.
 
+### 프롬프트 엔지니어링 전략
+
+#### 출력 형식 강제
+- system prompt에 JSON schema 전체를 포함 (구조 명세)
+- `respond ONLY with valid JSON` 패턴 — markdown 감싸기 방지
+- 허용 필드 외 필드가 포함되면 CH03 파싱 단계에서 거부된다는 전제로 설계
+
+#### Few-shot 예시
+- plan 생성 prompt에 (요청 → plan.md) 예시 1쌍 고정 삽입
+- 예시는 실제 성공한 케이스 기반 (testdata/plans/safe_plan.md 재활용)
+- 토큰 예산 초과 시 few-shot 블록을 가장 먼저 축소 (압축 우선순위)
+
+#### Retry Hint 설계
+- 첫 번째 시도: hint 없음
+- SYNTAX 에러 retry: 실패한 출력의 어디가 틀렸는지를 task 블록에 추가
+  ```
+  [이전 시도 실패]
+  에러: unexpected token at line 3
+  잘못된 출력 (앞 200자): ...
+  수정 후 다시 시도하세요.
+  ```
+- TRANSIENT retry: hint 없이 동일 prompt 재전송
+
+#### 결정론성 확보
+- temperature=0 고정 (plan/apply 단계) — diff 출력은 창의성 불필요
+- top_p / top_k 기본값 사용하지 않고 명시
+- 동일 요청에 동일 출력을 기대하는 테스트는 temperature=0 전제
+
 ### 완료 기준
 - CLAUDE.md를 로드해서 context에 포함한다
 - 파일 목록에서 관련 파일만 선택해서 context 크기를 줄인다
 - rule 충돌 시 우선순위 기준으로 하나가 선택된다
 - system / context / task 블록이 분리된 템플릿으로 구성된다
 - deny_context_paths에 매칭되는 파일은 context에 포함되지 않는다
+- system prompt에 JSON schema가 포함되고, 이를 벗어난 출력이 CH03에서 거부된다
+- retry 시 hint 블록이 task 블록에 추가되어 다음 호출에 전달된다
+- temperature=0으로 고정된 plan/apply 호출에서 동일 입력 → 동일 출력이 golden file 테스트로 검증된다
 
 ---
 
@@ -768,7 +799,7 @@ post hook은 apply 성공/실패 무관하게 전부 실행한다. 개별 체크
 |---|---|---|
 | pre hook PERMANENT 에러 | apply 전 | 정책 위반, 복구 불가 |
 | Gate 거부 (CH05) | plan 이후 | deny_paths / deny_ops 위반 |
-| budget 초과 (CH13) | API 호출 전 | `on_exceed: abort` 설정 시 |
+| budget 초과 (CH12) | API 호출 전 | `on_exceed: abort` 설정 시 |
 | retry >= MaxRetry (CH07) | verify 이후 | 무한 루프 방지 |
 | 동일 error signature 2회 연속 (CH07) | verify 이후 | 진전 없는 반복 방지 |
 
@@ -777,7 +808,7 @@ post hook은 apply 성공/실패 무관하게 전부 실행한다. 개별 체크
 | 조건 | 재개 트리거 |
 |---|---|
 | 429 rate limit (CH03) | Retry-After 대기 완료 |
-| rate limiter 토큰 고갈 (CH13) | 토큰 보충 완료 |
+| rate limiter 토큰 고갈 (CH12) | 토큰 보충 완료 |
 
 > Pause는 ctx cancel로 중단 가능하다. SIGINT 수신 시 대기 중인 hook도 취소된다.
 
@@ -835,9 +866,9 @@ Skill
 - 호출 후: Output 스키마 검증 (계약 위반 감지)
 - 검증 실패는 실행 에러와 구분된 SkillValidationError로 분류
 
-### CH16와 역할 분리
+### CH15와 역할 분리
 
-| | CH09 | CH16 |
+| | CH09 | CH15 |
 |---|---|---|
 | 관심사 | 단일 skill 실행 계약 | skill registry 운영 (등록/조회/목록) |
 | 범위 | skill 인터페이스 + 검증 | 다수 skill 관리 및 Flow 연결 |
@@ -862,7 +893,7 @@ type PlanStep struct {
 }
 ```
 
-Flow(CH14)에서 step을 실행할 때:
+Flow(CH13)에서 step을 실행할 때:
 
 ```
 [PlanStep 실행]
@@ -921,7 +952,7 @@ type Skill struct {
 - 동일 입력에 대해 동일 출력 계약이 보장된다 (멱등성)
 - `Idempotent: false` skill이 실패하면 retry 없이 abort된다
 - plan step의 type이 `skill`이면 LLM 호출 없이 registry에서 직접 실행된다
-- skill step 실행이 observability(CH12)에 별도 stage로 기록된다
+- skill step 실행이 observability(CH11)에 별도 stage로 기록된다
 
 ---
 
@@ -970,7 +1001,7 @@ type ToolCallOption struct {
 
 ---
 
-## CH12. Observability
+## CH11. Observability
 
 - stage timing
 - token usage
@@ -1017,7 +1048,7 @@ func (r *SpanRecorder) Summary() []Span {
 }
 ```
 
-CH14 Flow에서의 사용:
+CH13 Flow에서의 사용:
 
 ```go
 err = recorder.Record("apply", func() error {
@@ -1051,7 +1082,7 @@ slog.Error("stage.fail",
 ```
 
 > slog 레벨(Debug/Info/Error)은 stage 결과에 따라 구분한다.
-> SpanRecorder는 CH14에서 Flow에 주입되어 전 단계를 커버한다.
+> SpanRecorder는 CH13에서 Flow에 주입되어 전 단계를 커버한다.
 
 ### 완료 기준
 - 각 stage(context / plan / apply / verify)의 소요 시간을 출력한다
@@ -1063,7 +1094,7 @@ slog.Error("stage.fail",
 
 ---
 
-## CH13. Cost Control
+## CH12. Cost Control
 
 CH02에서 확보한 BudgetTokens 슬롯에 실제 로직 추가.
 
@@ -1088,8 +1119,8 @@ config 추가:
 
 ```yaml
 budget:
-  max_tokens: 0       # CH13 (0 = 제한 없음)
-  on_exceed: abort    # CH13
+  max_tokens: 0       # CH12 (0 = 제한 없음)
+  on_exceed: abort    # CH12
   max_rpm: 0          # 분당 최대 요청 수 (0 = 제한 없음)
   max_tpm: 0          # 분당 최대 토큰 수 (0 = 제한 없음)
 ```
@@ -1143,7 +1174,7 @@ API client 호출 전 `limiter.Wait(ctx)` 호출.
 
 ---
 
-## CH14. 하네스 완성 (Flow 컴포넌트)
+## CH13. 하네스 완성 (Flow 컴포넌트)
 
 Flow = plan → apply → verify 전체 실행 흐름을 조율하는 orchestrator.
 
@@ -1249,9 +1280,9 @@ if ctx.Err() != nil {
 
 ---
 
-## CH15. Multi-Agent
+## CH14. Multi-Agent
 
-> **의존 관계**: CH14 Flow 완성 후 진행한다. 각 agent는 CH14 Flow의 특정 단계만 실행하는 방식으로 분리된다.
+> **의존 관계**: CH13 Flow 완성 후 진행한다. 각 agent는 CH13 Flow의 특정 단계만 실행하는 방식으로 분리된다.
 
 - explorer / planner / implementer / verifier
 - 필요할 때만 사용
@@ -1303,15 +1334,72 @@ func (r *FileLockRegistry) Lock(path string) func() {
 }
 ```
 
+### Agent 간 결과 합성
+
+각 agent는 독립 실행이지만, planner → implementer처럼 순서가 있는 경우
+이전 agent의 출력을 다음 agent의 입력으로 주입한다.
+
+**순차 파이프라인 패턴**
+
+agent가 역할별로 순서가 정해진 경우:
+
+    [Explorer] → files []string
+         │
+         ▼
+    [Planner]  → plan Plan       ← Explorer 결과를 context에 주입
+         │
+         ▼
+    [Implementer] → patch Diff   ← Plan을 입력으로 사용
+         │
+         ▼
+    [Verifier]    → VerifyResult
+
+각 단계의 출력 타입을 명시하고, 다음 agent 생성 시 생성자에 주입:
+
+```go
+type PipelineInput struct {
+    Request string
+    Files   []string  // Explorer가 채움
+    Plan    *Plan     // Planner가 채움
+    Patch   *Diff     // Implementer가 채움
+}
+```
+
+**병렬 실행 가능 조건**
+
+동일 파이프라인 단계에서만 병렬화한다.
+파일 lock(FileLockRegistry)이 같은 파일에 대한 경쟁을 직렬화한다.
+
+### 부분 실패 처리
+
+agent 하나가 실패했을 때 전체를 abort할지, 나머지 결과를 사용할지를 명시.
+
+```go
+type AgentPolicy string
+
+const (
+    AgentPolicyFailFast   AgentPolicy = "fail-fast"   // 하나 실패 → 전체 cancel
+    AgentPolicyBestEffort AgentPolicy = "best-effort" // 나머지 결과 사용
+)
+```
+
+- plan / apply 단계는 `fail-fast` (부분 적용은 더 위험)
+- explore 단계는 `best-effort` 허용 (일부 파일 분석 실패해도 진행 가능)
+- 선택된 정책은 Observability(CH11)에 기록
+
 ### 완료 기준
 - 두 agent가 동일 파일을 동시에 수정하려 할 때 하나가 대기한다
 - 각 agent 역할(explorer / planner / implementer / verifier)이 분리되어 동작한다
 - 하나의 agent가 에러를 반환하면 나머지 agent가 ctx cancel로 중단된다
 - 모든 agent 결과가 수집된 후 다음 단계로 진행된다
+- planner agent가 explorer 결과를 입력으로 받아 plan을 생성한다
+- `fail-fast` 정책에서 하나의 agent 실패 시 나머지가 ctx cancel로 중단된다
+- `best-effort` 정책에서 일부 agent 실패 시 성공한 결과만 수집해 다음 단계로 진행된다
+- 병렬 agent가 동일 파일을 동시에 수정하려 할 때 하나가 lock을 대기한다
 
 ---
 
-## CH16. 확장
+## CH15. 확장
 
 ### Skill Registry 완성 (CH09 연결)
 
@@ -1320,7 +1408,7 @@ CH09에서 정의한 단일 Skill 실행 계약을 registry로 운영한다.
 - 등록: `registry.Register(skill)` — 중복 시 패닉
 - 조회: `registry.Get(name)` — 없으면 에러 반환
 - 목록: `registry.List()` — 등록된 전체 skill 이름 반환
-- Flow(CH14)에서 `StepTypeSkill` step 실행 시 registry 경유
+- Flow(CH13)에서 `StepTypeSkill` step 실행 시 registry 경유
 
 ### PR 자동화
 
@@ -1336,7 +1424,7 @@ Verify 성공 후 변경 사항을 자동으로 PR로 제출한다.
 [GitHub API → PR 생성]
       │
       ▼
-[PR URL → Observability(CH12) 기록]
+[PR URL → Observability(CH11) 기록]
 ```
 
 - credential 로드: CH02의 API key 로드 패턴과 동일 (`GITHUB_TOKEN` 환경변수 우선)
@@ -1354,7 +1442,7 @@ PR 리뷰 코멘트를 새 요청으로 재입력해 수정 → PR 업데이트 
 [코멘트 → 새 요청으로 변환]
       │
       ▼
-[Flow(CH14) 재실행]
+[Flow(CH13) 재실행]
       │
       ▼
 [Verify 성공 → PR 업데이트]
@@ -1432,8 +1520,61 @@ func (r *PluginRegistry) ForFile(path string) (LanguagePlugin, bool) {
 
 > 이 패턴을 구현하면 CH06의 Go 전용 코드가 얼마나 잘 분리되어 있는지 자연스럽게 검증된다.
 
+### Harness Evaluation
+
+하네스를 구현하면 "얼마나 잘 동작하는가"를 측정해야 한다.
+평가 없이는 개선 방향을 알 수 없다.
+
+#### 핵심 지표
+
+| 지표 | 정의 | 계산 방법 |
+|---|---|---|
+| Task 성공률 | plan → apply → verify 전 흐름이 retry 없이 1회 통과한 비율 | success / total |
+| Retry율 | 요청당 평균 retry 횟수 | total_retries / total_requests |
+| Plan-Apply 일치율 | plan의 target file과 실제 적용된 파일이 일치한 비율 | matched / planned |
+| Gate 거부율 | plan gate에서 거부된 plan 비율 | rejected / total_plans |
+
+#### 평가용 Task Suite
+
+golden task 파일을 testdata/tasks/ 에 저장:
+
+```
+testdata/tasks/
+├── task_01_add_func.yaml      # 함수 추가
+├── task_02_fix_bug.yaml       # 버그 수정
+├── task_03_refactor.yaml      # 리팩토링
+└── task_04_dangerous.yaml     # gate 거부 기대 케이스
+```
+
+각 task 파일 구조:
+
+```yaml
+request: "add a function that returns the sum of two integers"
+expect:
+  gate_pass: true
+  verify_pass: true
+  max_retries: 1
+```
+
+#### Regression 테스트
+
+이전에 성공한 task가 코드 변경 후에도 동일하게 성공하는지 검증.
+SpanRecorder(CH11) 결과를 JSON으로 직렬화해 golden output과 비교.
+
+```go
+func TestHarnessRegression(t *testing.T) {
+    for _, tc := range loadTaskSuite("testdata/tasks") {
+        t.Run(tc.Name, func(t *testing.T) {
+            result := runHarness(tc.Request)  // Mock LLM 사용
+            assert.Equal(t, tc.Expect.GatePass, result.GatePassed)
+            assert.LessOrEqual(t, result.RetryCount, tc.Expect.MaxRetries)
+        })
+    }
+}
+```
+
 ### 완료 기준
-- skill registry에 skill을 등록하고 CH14 Flow에서 step으로 실행된다
+- skill registry에 skill을 등록하고 CH13 Flow에서 step으로 실행된다
 - 존재하지 않는 skill 이름 조회 시 에러를 반환한다
 - Verify 성공 후 자동으로 PR이 생성되고 URL이 기록된다
 - 리뷰 코멘트를 입력으로 받아 수정 → PR 업데이트 사이클이 동작한다
@@ -1441,6 +1582,9 @@ func (r *PluginRegistry) ForFile(path string) (LanguagePlugin, bool) {
 - `api.provider` 설정 변경만으로 LLM 구현체가 교체되고 Flow는 변경되지 않는다
 - 새 LanguagePlugin을 등록하면 해당 확장자 파일에 포매팅과 검증이 적용된다
 - plugin이 없는 확장자 파일에 Apply가 정상 동작한다
+- task suite 실행 후 task별 성공률, retry율, gate 거부율이 출력된다
+- 이전 실행 결과와 비교해 지표가 악화된 경우 테스트가 실패한다
+- `--eval` 플래그로 전체 task suite를 실행하고 지표 리포트를 출력할 수 있다
 
 ---
 
@@ -1457,17 +1601,17 @@ func (r *PluginRegistry) ForFile(path string) (LanguagePlugin, bool) {
 7. 위험 실행 → CH08
 8. 반복 작업 → CH09
 9. 외부 연결 → CH10
-10. 상태 안 보임 → CH12
-11. 비용 터짐 → CH13
-12. 전체 통합 → CH14
-13. 복잡도 증가 → CH15 (CH14 이후, Flow 완성 후 진행)
+10. 상태 안 보임 → CH11
+11. 비용 터짐 → CH12
+12. 전체 통합 → CH13
+13. 복잡도 증가 → CH14 (CH13 이후, Flow 완성 후 진행)
 
 ---
 
 # 📌 결론
 
 - Parsing은 CH03에 포함 (고정)
-- CallOption.BudgetTokens는 CH02에서 구조 정의, CH13에서 로직 (고정)
+- CallOption.BudgetTokens는 CH02에서 구조 정의, CH12에서 로직 (고정)
 - Plan Gate 정책은 외부 설정 파일로 분리 (고정)
 - Apply Engine = unified diff + AST 검증 전용 (고정)
 - Apply Engine = atomic write 기반 rollback (고정)
@@ -1475,9 +1619,9 @@ func (r *PluginRegistry) ForFile(path string) (LanguagePlugin, bool) {
 - Plan = CH05 (고정)
 - Apply = CH06 (고정)
 - Verify = CH07 (고정)
-- Flow orchestrator = CH14 (고정)
+- Flow orchestrator = CH13 (고정)
 - 인터페이스 설계 원칙은 CH01에서 확립, 전 챕터에서 적용 (고정)
 - 테스트 인프라(Mock 서버, Golden File)는 CH02에서 구축, 전 챕터에서 재사용 (고정)
-- Rate Limiting = CH13 (고정, budget 섹션과 통합)
-- Graceful Shutdown = CH14 (고정, Flow 완성과 동시 구현)
+- Rate Limiting = CH12 (고정, budget 섹션과 통합)
+- Graceful Shutdown = CH13 (고정, Flow 완성과 동시 구현)
 - Tool 응답 신뢰 경계 = CH10 (고정, CH03 LLM 출력 신뢰 경계와 동일 원칙)
