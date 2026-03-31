@@ -156,10 +156,56 @@ engine := NewApplyEngine(NewPolicyHook(cfg))
 > 각 챕터에서 stub을 먼저 정의하고 나중에 교체하는 이유가 바로 이 패턴이다.
 > 인터페이스 없이 구체 타입을 직접 참조하면 교체 시 모든 호출부를 수정해야 한다.
 
+### Config 로드 및 검증 패턴
+
+모든 챕터의 설정값은 단일 Config 구조체를 통해 로드된다. 각 챕터는 자신의 섹션에 `Validate()` 메서드를 추가하는 방식으로 검증 책임을 분산한다.
+
+```go
+type Config struct {
+    API     APIConfig     `yaml:"api"`
+    Gate    GateConfig    `yaml:"gate"`
+    Context ContextConfig `yaml:"context"`
+    Budget  BudgetConfig  `yaml:"budget"`
+}
+
+func LoadConfig(path string) (Config, error) {
+    // 1. 파일 읽기
+    // 2. YAML 파싱
+    // 3. 각 섹션 Validate() 호출
+    var cfg Config
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return Config{}, err
+    }
+    return cfg, cfg.Validate()
+}
+
+func (c Config) Validate() error {
+    return errors.Join(
+        c.API.Validate(),
+        c.Gate.Validate(),
+        c.Context.Validate(),
+        c.Budget.Validate(),
+    )
+}
+
+// 각 챕터가 자신의 섹션에 구현 — 예시
+func (c APIConfig) Validate() error {
+    if c.Model == "" {
+        return errors.New("api.model is required")
+    }
+    return nil
+}
+```
+
+> 각 챕터는 자신의 config 섹션이 추가될 때 `Validate()` 메서드를 함께 구현한다.
+> 이 패턴을 CH01에서 확립하지 않으면 CH14 통합 시 검증 로직이 분산되거나 누락된다.
+
 ### 완료 기준
 - 하네스 전체 구성요소 9개의 역할과 실행 순서를 설명할 수 있다
 - 각 컴포넌트가 어느 챕터에서 구현되는지 매핑할 수 있다
 - 인터페이스 설계 위치 테이블을 기준으로 각 컴포넌트의 교체 지점을 설명할 수 있다
+- config 파일 로드 시 필수 필드 누락이 명확한 에러로 반환된다
+- 각 챕터가 자신의 config 섹션에 `Validate()` 메서드를 추가하는 패턴이 확립된다
 
 ---
 
@@ -583,11 +629,43 @@ Skill
 | 관심사 | 단일 skill 실행 계약 | skill registry 운영 (등록/조회/목록) |
 | 범위 | skill 인터페이스 + 검증 | 다수 skill 관리 및 Flow 연결 |
 
+### Flow와의 연결
+
+plan step에 `type` 필드를 추가해 LLM 호출 없이 skill을 직접 실행할 수 있다.
+
+```go
+type StepType string
+
+const (
+    StepTypeLLM   StepType = "llm"
+    StepTypeSkill StepType = "skill"
+)
+
+type PlanStep struct {
+    Type   StepType       // "llm" | "skill"
+    Skill  string         // type=skill일 때 registry 조회 키
+    Input  map[string]any // skill 입력
+    Target string         // type=llm일 때 대상 파일
+}
+```
+
+Flow(CH14)에서 step을 실행할 때:
+
+```
+[PlanStep 실행]
+      │
+      ├── type = "llm"   → Claude API 호출 → Apply Engine
+      └── type = "skill" → registry.Get(name) → Execute(input)
+```
+
+> skill step은 LLM 호출과 Apply를 건너뛰므로 observability에서도 별도 분기로 기록한다.
+
 ### 완료 기준
 - skill을 정의하고 이름으로 registry에 등록할 수 있다
 - 존재하지 않는 이름으로 조회 시 에러를 반환한다
 - Input 스키마 검증 실패 시 실행 전에 SkillValidationError를 반환한다
 - 동일 입력에 대해 동일 출력 계약이 보장된다
+- plan step의 type이 `skill`이면 LLM 호출 없이 registry에서 직접 실행된다
 
 ---
 
@@ -637,6 +715,9 @@ type ToolCallOption struct {
 ---
 
 ## CH11. Multi-Agent
+
+> **의존 관계**: CH11은 CH14의 Flow를 전제로 한다. CH14 완성 후 이 챕터로 돌아오거나, CH14 직후에 학습하는 것을 권장한다.
+> 각 agent는 CH14 Flow의 특정 단계만 실행하는 방식으로 분리된다.
 
 - explorer / planner / implementer / verifier
 - 필요할 때만 사용
@@ -703,10 +784,89 @@ func (r *FileLockRegistry) Lock(path string) func() {
 - retry count
 - failure tracking
 
+### SpanRecorder
+
+외부 라이브러리 없이 span 개념을 직접 구현한다. Flow의 각 stage를 `Record`로 감싸면 전체 실행 타임라인이 자동으로 수집된다.
+
+```go
+type Span struct {
+    Stage     string
+    StartedAt time.Time
+    Duration  time.Duration
+    TokensIn  int
+    TokensOut int
+    Err       error
+}
+
+type SpanRecorder struct {
+    mu    sync.Mutex
+    spans []Span
+}
+
+func (r *SpanRecorder) Record(stage string, fn func() error) error {
+    start := time.Now()
+    err := fn()
+    r.mu.Lock()
+    r.spans = append(r.spans, Span{
+        Stage:     stage,
+        StartedAt: start,
+        Duration:  time.Since(start),
+        Err:       err,
+    })
+    r.mu.Unlock()
+    return err
+}
+
+func (r *SpanRecorder) Summary() []Span {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    return slices.Clone(r.spans)
+}
+```
+
+CH14 Flow에서의 사용:
+
+```go
+err = recorder.Record("apply", func() error {
+    return applyEngine.Apply(ctx, patch)
+})
+err = recorder.Record("verify", func() error {
+    return verifier.Run(ctx)
+})
+```
+
+### 구조화 로깅 (slog)
+
+```go
+// stage 진입
+slog.Info("stage.start", "stage", "apply", "request_id", reqID)
+
+// stage 완료
+slog.Info("stage.done",
+    "stage", "apply",
+    "duration_ms", span.Duration.Milliseconds(),
+    "tokens_in", span.TokensIn,
+    "tokens_out", span.TokensOut,
+)
+
+// stage 실패
+slog.Error("stage.fail",
+    "stage", "apply",
+    "err", err,
+    "retry", retryCount,
+)
+```
+
+> slog 레벨(Debug/Info/Error)은 stage 결과에 따라 구분한다.
+> SpanRecorder는 CH14에서 Flow에 주입되어 전 단계를 커버한다.
+
 ### 완료 기준
 - 각 stage(context / plan / apply / verify)의 소요 시간을 출력한다
 - 요청별 token usage를 기록한다
 - retry 횟수와 실패 유형을 추적한다
+- 각 stage가 SpanRecorder를 통해 timing을 기록한다
+- 실행 종료 후 전체 span 요약(stage / duration / err)을 출력할 수 있다
+- slog 레벨(Debug/Info/Error)이 stage 결과에 따라 구분된다
 
 ---
 
