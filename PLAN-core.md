@@ -1,0 +1,2223 @@
+# AI Agent Harness — Core (CH01~CH13)
+
+> 핵심 파이프라인 챕터입니다. CH13 완성이 이 파일의 목표입니다.
+> 확장 챕터는 [PLAN-ext.md](PLAN-ext.md)를 참조하세요.
+
+---
+
+## CH01. 하네스의 실체
+
+- LLM ≠ 실행 주체
+- 하네스 = 실행 시스템
+
+### 테스트 전략 개요
+
+이 프로젝트에서 테스트는 세 레이어로 접근한다:
+
+| 레이어 | 대상 | 방법 |
+|---|---|---|
+| Unit | Parser, Gate, ErrorClassifier 등 순수 함수 | 실제 LLM 없이 고정 입력 → 고정 출력 검증 |
+| Mock LLM | API client, Context Builder | 미리 준비한 응답 파일(golden file)로 LLM 대체 |
+| Integration | Flow orchestrator, Apply Engine | 실제 파일 시스템 + 임시 디렉터리 사용 |
+
+> 각 챕터 완료 기준 항목에는 `[U]` Unit / `[M]` Mock LLM / `[I]` Integration 레이어 표기가 붙어 있다.
+> 복수 레이어가 가능한 항목은 주 레이어만 표기한다.
+> LLM을 실제로 호출하는 테스트는 CI에 포함하지 않는다 (비용 및 비결정성).
+
+### 전체 아키텍처 흐름
+
+    [사용자 요청]
+         │
+         ▼
+    [Context Builder] ──→ CLAUDE.md / 파일 선택 / 압축
+         │
+         ▼
+    [Plan 생성] ──→ Plan Gate (검증 / 위험 필터)
+         │
+         ▼
+    [Claude API 호출] ──→ [Parser] ──→ 구조화된 출력
+         │
+         ▼
+    [Apply Engine] ──→ unified diff 적용 / rollback
+         │
+         ▼
+    [Verify / Retry] ──→ test / lint / 상태 전이
+         │
+         ▼
+    [Hook] ──→ pre/post 정책 실행
+         │
+         ▼
+    [Observability] ──→ timing / token / retry 기록
+         │
+         ▼
+    [Cost Control] ──→ budget 초과 시 abort 또는 축소
+
+### 데이터 흐름
+
+    사용자 요청
+      → (context 구성) → prompt
+      → (API 호출) → raw 응답
+      → (parsing) → structured output
+      → (plan 생성) → plan.md
+      → (gate 검증) → 통과/거부
+      → (apply) → 파일 변경
+      → (verify) → 성공/실패
+      → (retry or done)
+
+### 전역 Config 구조
+
+모든 챕터의 설정값은 단일 config 파일을 기준으로 한다. 각 챕터는 자신의 섹션만 추가한다.
+
+```yaml
+api:
+  key: ""                          # CH02
+  model: claude-sonnet-4-6         # CH02
+  max_tokens: 8192                 # CH02
+
+gate:
+  deny_paths: [go.mod, .github/**] # CH05
+  deny_ops: [delete, rename]       # CH05
+  on_violation: abort              # CH05
+
+context:
+  deny_context_paths: [.env, "*secret*", "*credential*"]  # CH04
+  max_tokens: 4096                 # CH04
+
+budget:
+  max_tokens: 0                    # CH12 (0 = 제한 없음)
+  on_exceed: abort                 # CH12
+```
+
+> 이 구조는 구현 없이 설계 기준으로만 존재한다.
+> 각 챕터에서 자신의 섹션을 구현할 때 이 스키마를 참조한다.
+> 설정값 위치가 분산되면 CH13 통합 시 충돌이 생기므로 이 파일이 유일한 anchor다.
+
+### 인터페이스 설계 원칙
+
+이 프로젝트 전체에서 반복되는 패턴을 CH01에서 미리 확립한다.
+
+**Go 인터페이스의 역할**
+
+인터페이스는 구현체를 교체 가능하게 만드는 유일한 수단이다. 테스트에서 Mock으로 교체하거나, 챕터 간 단계적 구현 교체(stub → 실제 구현)가 가능한 이유다. Go에서 인터페이스는 사용하는 쪽(caller)에서 정의한다.
+
+**이 프로젝트에서 인터페이스가 적용되는 위치**
+
+| 인터페이스 | 사용처 | 테스트 대체 | 운영 구현 | 챕터 |
+|---|---|---|---|---|
+| `HookRunner` | ApplyEngine | `NoopHook` | `PolicyHook` | CH06 stub → CH08 구현 |
+| `LLMClient` | Flow | `MockClient` | `APIClient` | CH02 구현 → CH13 주입 |
+| `Verifier` | Flow | `AlwaysPassVerifier` | `TestRunner` | CH07 구현 → CH13 주입 |
+| `ContextBuilder` | Flow | `FixedContextBuilder` | `RealContextBuilder` | CH04 구현 → CH13 주입 |
+
+**의존성 주입 패턴**
+
+```go
+// 인터페이스는 사용하는 쪽에서 정의
+type HookRunner interface {
+    Pre(ctx context.Context, plan Plan) error
+    Post(ctx context.Context, result ApplyResult) error
+}
+
+// ApplyEngine은 구현체를 모른다
+type ApplyEngine struct {
+    hook HookRunner
+}
+
+func NewApplyEngine(hook HookRunner) *ApplyEngine { ... }
+
+// 테스트: NoopHook 주입
+engine := NewApplyEngine(&NoopHook{})
+
+// 운영: PolicyHook 주입
+engine := NewApplyEngine(NewPolicyHook(cfg))
+```
+
+> 각 챕터에서 stub을 먼저 정의하고 나중에 교체하는 이유가 바로 이 패턴이다.
+> 인터페이스 없이 구체 타입을 직접 참조하면 교체 시 모든 호출부를 수정해야 한다.
+
+### 에러 타입 설계 원칙
+
+이 프로젝트에서 에러는 caller가 분기할 수 있도록 구조화한다. 에러 분류(TRANSIENT / PERMANENT / SYNTAX)가 CH03, CH07, CH10에 걸쳐 사용되므로 CH01에서 공통 타입을 확립한다.
+
+```go
+type ErrorClass string
+
+const (
+    ErrorClassTransient ErrorClass = "TRANSIENT" // 재시도 가능
+    ErrorClassPermanent ErrorClass = "PERMANENT" // 즉시 abort
+    ErrorClassSyntax    ErrorClass = "SYNTAX"    // retry + hint 추가
+)
+
+type HarnessError struct {
+    Class   ErrorClass
+    Stage   string // "parse", "apply", "verify" 등
+    Wrapped error
+}
+
+func (e *HarnessError) Error() string {
+    return fmt.Sprintf("[%s/%s] %v", e.Stage, e.Class, e.Wrapped)
+}
+func (e *HarnessError) Unwrap() error { return e.Wrapped }
+```
+
+**에러 분류 확인은 `errors.As` 사용**
+
+```go
+var he *HarnessError
+if errors.As(err, &he) && he.Class == ErrorClassTransient {
+    // retry
+}
+```
+
+**규칙**
+- sentinel error는 단순 상태 표현(EOF 등)에만 사용, 분기가 필요한 에러는 `HarnessError`로 래핑
+- 에러 래핑 시 `fmt.Errorf("...: %w", err)` 사용 — `errors.Is` / `errors.As` 체인 유지
+- 에러를 새로 생성하는 위치(발생 지점)에서만 `HarnessError`를 생성, 상위 레이어는 그대로 전파
+
+> 이 타입은 CH03(에러 분류), CH07(상태 전이 조건), CH10(tool 응답 처리)에서 공통으로 사용한다.
+> 각 챕터에서 별도 에러 타입을 정의하면 CH13 통합 시 분류 로직이 중복된다.
+
+### Config 로드 및 검증 패턴
+
+모든 챕터의 설정값은 단일 Config 구조체를 통해 로드된다. 각 챕터는 자신의 섹션에 `Validate()` 메서드를 추가하는 방식으로 검증 책임을 분산한다.
+
+```go
+type Config struct {
+    API     APIConfig     `yaml:"api"`
+    Gate    GateConfig    `yaml:"gate"`
+    Context ContextConfig `yaml:"context"`
+    Budget  BudgetConfig  `yaml:"budget"`
+}
+
+func LoadConfig(path string) (Config, error) {
+    // 1. 파일 읽기
+    // 2. YAML 파싱
+    // 3. 각 섹션 Validate() 호출
+    var cfg Config
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return Config{}, err
+    }
+    return cfg, cfg.Validate()
+}
+
+func (c Config) Validate() error {
+    return errors.Join(
+        c.API.Validate(),
+        c.Gate.Validate(),
+        c.Context.Validate(),
+        c.Budget.Validate(),
+    )
+}
+
+// 각 챕터가 자신의 섹션에 구현 — 예시
+func (c APIConfig) Validate() error {
+    if c.Model == "" {
+        return errors.New("api.model is required")
+    }
+    return nil
+}
+```
+
+> 각 챕터는 자신의 config 섹션이 추가될 때 `Validate()` 메서드를 함께 구현한다.
+> 이 패턴을 CH01에서 확립하지 않으면 CH13 통합 시 검증 로직이 분산되거나 누락된다.
+
+### Config 스키마 마이그레이션 전략
+
+#### 문제: 챕터마다 config 필드가 추가된다
+
+CH02에서 만든 config 파일을 CH12 학습 중 열면 새로 추가된 필드가 없다. 이때 어떻게 동작해야 하는가?
+
+**방침**
+
+| 상황 | 동작 |
+|---|---|
+| 새 필드가 config에 없음 | 기본값 사용 (에러 아님) |
+| 알 수 없는 필드가 config에 있음 | 경고 로그 후 무시 |
+| 필수 필드(api.key 등)가 없음 | 에러 반환 |
+
+**Unknown Field 처리**
+
+`yaml.Unmarshal`은 기본적으로 unknown field를 무시한다. 개발 중에는 unknown field를 경고로 출력해서 오타를 잡는 것이 유용하다:
+
+```go
+func LoadConfig(path string) (Config, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return Config{}, err
+    }
+
+    // 1단계: strict 파싱으로 unknown field 감지
+    decoder := yaml.NewDecoder(bytes.NewReader(data))
+    decoder.KnownFields(true)
+    var strict Config
+    if err := decoder.Decode(&strict); err != nil {
+        // unknown field는 경고로만 처리 (하위 호환)
+        slog.Warn("config.unknown_fields", "err", err)
+    }
+
+    // 2단계: 관대한 파싱으로 실제 로드
+    var cfg Config
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return Config{}, fmt.Errorf("config parse error: %w", err)
+    }
+
+    // 3단계: 기본값 채우기
+    cfg.applyDefaults()
+
+    // 4단계: 필수 필드 검증
+    return cfg, cfg.Validate()
+}
+```
+
+**기본값 패턴**
+
+각 config 섹션이 자신의 기본값을 책임진다:
+
+```go
+func (c *APIConfig) applyDefaults() {
+    if c.Model == "" {
+        c.Model = "claude-sonnet-4-6"
+    }
+    if c.MaxTokens == 0 {
+        c.MaxTokens = 8192
+    }
+}
+
+func (c *Config) applyDefaults() {
+    c.API.applyDefaults()
+    c.Gate.applyDefaults()
+    c.Context.applyDefaults()
+    c.Budget.applyDefaults()
+}
+```
+
+**스키마 버전 필드**
+
+챕터가 많아지면 config 구조가 크게 바뀔 수 있다. version 필드로 config가 어느 시점에 만들어진 것인지를 명시한다:
+
+```yaml
+version: "1"
+api:
+  model: claude-sonnet-4-6
+```
+
+```go
+type Config struct {
+    Version string    `yaml:"version"`
+    // ...
+}
+
+func (c Config) Validate() error {
+    if c.Version != "" && c.Version != currentConfigVersion {
+        slog.Warn("config.version_mismatch",
+            "found", c.Version,
+            "expected", currentConfigVersion,
+        )
+        // 에러가 아닌 경고 — 하위 호환 유지
+    }
+    return errors.Join(...)
+}
+```
+
+> 이 패턴은 CH13 통합 시 가장 효과가 크다.
+> 이전 챕터에서 만든 config 파일을 CH13에서 그대로 쓸 수 있어야 하기 때문이다.
+
+### 완료 기준
+- [U] 하네스 전체 구성요소 9개의 역할과 실행 순서를 설명할 수 있다
+- [U] 각 컴포넌트가 어느 챕터에서 구현되는지 매핑할 수 있다
+- [U] 인터페이스 설계 위치 테이블을 기준으로 각 컴포넌트의 교체 지점을 설명할 수 있다
+- [U] config 파일 로드 시 필수 필드 누락이 명확한 에러로 반환된다
+- [U] 각 챕터가 자신의 config 섹션에 `Validate()` 메서드를 추가하는 패턴이 확립된다
+- [U] unknown field가 포함된 config 로드 시 경고 로그가 출력되고 실행은 계속된다
+- [U] config에 없는 선택 필드는 기본값으로 채워진다
+
+---
+
+## CH02. Claude API 기본
+
+- API 요청 / 응답 구조
+- CallOption 설계 (Model, MaxTokens, BudgetTokens, CacheControl)
+  - BudgetTokens는 기본값 0 = 제한 없음, CH12에서 로직 채움
+- API Key 로드 순서
+  1. 환경변수 우선
+  2. config 파일 fallback
+- HTTP 레벨 에러 처리 (4xx / 5xx 분류)
+
+### context.Context 인터페이스 확립
+
+이 챕터에서 모든 함수의 첫 인자를 `ctx context.Context`로 고정한다.
+
+```go
+func (c *Client) Call(ctx context.Context, opt CallOption, prompt string) (Response, error)
+```
+
+이후 모든 챕터는 이 인터페이스를 그대로 따른다. 나중에 추가하면 CH02~CH13의 인터페이스를 전부 수정해야 하므로 여기서 확립한다.
+
+- `ctx`를 HTTP 요청에 전달 → 상위에서 cancel 시 요청 즉시 중단
+- CH08 abort: `cancel()` 호출로 전파
+- CH14 goroutine: 각 agent goroutine이 동일 ctx를 공유 → 하나가 실패하면 전체 취소 가능
+
+> BudgetTokens 슬롯을 처음부터 포함하는 이유:
+> CH12에서 retrofit하면 CallOption 구조 전체를 변경해야 하므로 슬롯만 먼저 확보.
+
+### 테스트 인프라 구축
+
+CH02부터 모든 챕터가 Mock LLM을 필요로 한다. 여기서 한 번 구축하고 이후 챕터에서 재사용한다.
+
+**Golden File 구조**
+
+`simple_response.json` 예시 (Claude Messages API 응답 형식):
+
+```json
+{
+  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "text",
+      "text": "Hello, world!"
+    }
+  ],
+  "model": "claude-sonnet-4-6",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5
+  }
+}
+```
+
+```
+testdata/
+├── api/
+│   ├── simple_response.json          // 정상 단일 응답
+│   ├── 429_rate_limit.json           // Rate limit 에러
+│   ├── 500_server_error.json         // 서버 에러
+│   └── streaming/
+│       ├── chunk_01.json             // SSE 청크 (CH03용)
+│       └── chunk_02.json
+├── diffs/
+│   ├── valid_patch.diff              // 정상 unified diff (CH06용)
+│   └── malformed_patch.diff          // 깨진 diff
+└── plans/
+    └── safe_plan.md                  // 정상 plan (CH05용)
+```
+
+**Mock HTTP 서버 패턴**
+
+```go
+// 테스트마다 서버를 띄우고 URL을 Client에 주입
+func newMockServer(t *testing.T, fixture string) *httptest.Server {
+    t.Helper()
+    data, err := os.ReadFile(filepath.Join("testdata/api", fixture))
+    require.NoError(t, err)
+
+    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.Write(data)
+    }))
+    t.Cleanup(srv.Close)
+    return srv
+}
+
+// 사용
+srv := newMockServer(t, "simple_response.json")
+client := NewClient(WithBaseURL(srv.URL))
+```
+
+**호출 횟수 카운팅 (retry 검증용)**
+
+```go
+type countingHandler struct {
+    count    int
+    response []byte
+}
+
+func (h *countingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    h.count++
+    w.WriteHeader(http.StatusServiceUnavailable)
+    w.Write(h.response)
+}
+```
+
+**임시 디렉터리 규칙**
+
+- `t.TempDir()` 사용 — 테스트 종료 시 자동 정리
+- 테스트 간 파일 공유 금지 (각 테스트가 독립된 디렉터리 사용)
+- 실제 작업 디렉터리의 파일을 수정하는 테스트 작성 금지
+
+> 연결 끊김 시뮬레이션: `net.Pipe()`로 연결 후 즉시 close → `io.ErrUnexpectedEOF` 발생
+> 이 패턴은 CH03 스트리밍 중단 테스트에서 사용한다.
+
+### 완료 기준
+- [M] API key 로드 → 단일 요청 → 응답 수신까지 동작한다
+- [M] 4xx / 5xx 에러를 구분해서 처리한다
+- [U] 모든 공개 함수가 `ctx context.Context`를 첫 인자로 받는다
+- [M] ctx가 cancel되면 진행 중인 HTTP 요청이 중단된다
+  - 검증 방법: `net.Pipe()`로 연결 후 요청 도중 `cancel()` 호출 → `context.Canceled` 에러 확인
+- [M] Mock HTTP 서버가 fixture 파일을 응답으로 반환한다
+- [I] 임시 디렉터리에서 파일 생성/수정이 테스트 종료 후 자동 정리된다
+- [M] 호출 횟수 카운팅으로 retry 동작을 검증할 수 있다
+
+---
+
+## CH03. Parsing + 호출 안정화
+
+> 이 챕터는 두 관심사를 하나로 묶은 예외적 구조다.
+> **Part 1 (파싱)**과 **Part 2 (호출 안정화)**를 분리하지 않은 이유:
+> 파싱 실패의 SYNTAX 분류와 호출 실패의 TRANSIENT 분류가 동일한 `HarnessError` 타입과
+> 동일한 retry 경로를 공유한다. 두 파트를 별도 챕터로 두면 에러 분류 기준이
+> 어느 챕터에 속하는지 모호해지고 CH07 상태 머신과의 연결이 분산된다.
+> 구현 시작은 Part 1 → Part 2 순서로 진행한다.
+
+### Part 1. 응답 파싱 + 신뢰 경계
+
+"LLM 출력을 어떻게 읽는가"에 집중한다.
+
+- structured output 파싱
+- fallback parsing (markdown strip, JSON fragment 추출)
+- LLM 출력 신뢰 경계
+
+#### 스트리밍 응답 처리
+
+- SSE(Server-Sent Events) 청크 수신 루프
+- 청크 단위 누적 파싱 (부분 JSON 조립)
+- 스트리밍 중단(EOF / 네트워크 단절) 시 처리
+- 스트리밍 vs 단일 응답 파싱 인터페이스 통일
+
+> 스트리밍 청크는 결국 "불완전한 응답을 어떻게 파싱하는가" 문제이므로 파싱 챕터에서 다룬다.
+> API 연결(CH02)은 연결 자체에 집중하고, 응답을 어떻게 소비하는지는 여기서 결정한다.
+
+#### LLM 출력 신뢰 경계
+
+LLM이 생성한 diff/JSON을 그대로 실행하면 안 된다.
+
+- 파싱 단계에서 구조 검증 (스키마 일치 여부)
+- 허용된 필드 외 unknown field 거부
+- 출력 크기 상한 적용 (비정상적으로 큰 응답 차단)
+
+> LLM 출력은 외부 입력과 동일한 신뢰 수준으로 처리한다.
+> 파싱 성공 ≠ 출력 신뢰. 구조가 맞아도 내용은 별도 검증이 필요하다.
+
+> CH02와 분리한 이유:
+> API 연결 자체와 응답 처리는 독립적인 관심사다.
+> CH02에서 둘을 묶으면 첫 동작 확인 전에 parsing 설계까지 결정해야 하는 부담이 생긴다.
+
+#### Diff 품질 처리
+
+LLM이 생성한 diff는 구조가 올바르더라도 실제 파일과 맞지 않을 수 있다. 파싱 성공과 apply 가능 여부는 다른 문제다.
+
+**실패 유형별 ErrorClass 분류**
+
+| 실패 상황 | ErrorClass | retry hint |
+|---|---|---|
+| diff 파싱 자체 실패 (포맷 오류) | SYNTAX | "unified diff 형식으로 다시 생성하세요" |
+| diff 파싱 성공 + context line 불일치로 apply 실패 | SYNTAX | "context line이 실제 파일과 다릅니다. 현재 파일 내용을 기준으로 다시 생성하세요" |
+| apply 성공 + AST syntax 검증 실패 | SYNTAX | 컴파일 에러 메시지 전달 |
+| apply 성공 + 검증 성공 | — | 정상 |
+
+> diff 파싱 실패와 context line 불일치를 동일하게 처리하면 hint가 부정확해진다.
+> 두 실패를 구분해서 각각 다른 hint를 retry에 전달해야 LLM이 올바르게 수정할 수 있다.
+
+**Context Line 불일치 감지**
+
+`go-gitdiff`는 context line이 맞지 않으면 apply 시점에 에러를 반환한다. 이 에러를 파싱 실패와 구분해서 래핑한다:
+
+```go
+func classifyApplyError(err error) *HarnessError {
+    if err == nil {
+        return nil
+    }
+    msg := err.Error()
+    switch {
+    case strings.Contains(msg, "context line"):
+        return &HarnessError{
+            Class:   ErrorClassSyntax,
+            Stage:   "apply/context_mismatch",
+            Wrapped: err,
+        }
+    default:
+        return &HarnessError{
+            Class:   ErrorClassSyntax,
+            Stage:   "apply",
+            Wrapped: err,
+        }
+    }
+}
+```
+
+**Retry Hint 생성**
+
+context line 불일치 시 retry prompt에 실제 파일의 해당 영역을 포함한다:
+
+```
+[이전 시도 실패]
+에러: context line mismatch at hunk 2
+실제 파일의 해당 영역 (line 40-50):
+  func Foo(x int) {
+      return x + 1
+  }
+diff의 context line과 다릅니다. 위 내용을 기준으로 diff를 다시 생성하세요.
+```
+
+> 이 hint가 없으면 LLM은 동일한 틀린 context line으로 diff를 재생성해 동일 signature로 abort된다.
+
+#### 완료 기준 (Part 1)
+- [U] LLM이 markdown 코드 블록으로 감싼 JSON을 올바르게 추출한다
+- [U] structured output 파싱 실패 시 fallback이 동작한다
+- [M] 스트리밍 응답을 청크 단위로 누적해 완성된 출력을 반환한다
+- [M] 스트리밍 중단 시 이미 수신한 청크를 기준으로 에러를 반환한다
+- [U] 허용 스키마 외 필드가 포함된 LLM 출력을 거부한다
+- [U] diff 파싱 실패와 context line 불일치 apply 실패가 각각 다른 Stage로 구분된 SYNTAX 에러로 반환된다
+- [I] context line 불일치 retry 시 hint에 실제 파일의 해당 영역이 포함된다
+
+---
+
+### Part 2. 호출 안정화
+
+"API 연결을 어떻게 안정화하는가"에 집중한다.
+
+- retry / backoff
+- 에러 분류 (transient / permanent / syntax) → CH01의 `HarnessError` 사용
+- 429 Retry-After 파싱 및 대기
+
+#### 에러 분류 기준
+
+| ErrorClass | 조건 예시 | 동작 |
+|---|---|---|
+| TRANSIENT | connection refused, timeout, 5xx | retry |
+| SYNTAX | 파싱 실패, 스키마 불일치 | retry + hint 추가 |
+| PERMANENT | 4xx (401/403), 요청 구조 오류 | abort |
+
+> CH01에서 정의한 `HarnessError`를 그대로 사용한다.
+> 이 챕터에서 새 에러 타입을 정의하지 않는다.
+
+#### 완료 기준 (Part 2)
+- [M] retry/backoff가 TRANSIENT 에러에서만 동작한다
+- [M] PERMANENT 에러에서 retry 없이 즉시 에러를 반환한다
+- [M] 429 수신 시 Retry-After 헤더에 명시된 시간만큼 대기 후 재시도한다
+- [U] 에러가 `HarnessError`로 래핑되어 Stage와 Class가 포함된다
+
+---
+
+## CH04. Context Builder + Selective Context
+
+- CLAUDE.md / AGENTS.md 로드
+- rule priority
+- conflict resolution
+- selective file selection
+- context compression
+
+### 프롬프트 템플릿 설계
+
+Context Builder가 구성하는 최종 prompt의 구조:
+
+```
+[system prompt]
+  - 하네스 역할 정의
+  - 출력 형식 명세 (unified diff / JSON schema)
+  - 금지 행동 명세
+
+[context block]
+  - CLAUDE.md 규칙
+  - 선택된 파일 내용
+
+[task block]
+  - 사용자 요청
+  - plan (있을 경우)
+  - 이전 실패 hint (retry 시)
+```
+
+- 블록별 템플릿 분리 (system / context / task)
+- few-shot 예시 삽입 위치 및 조건
+- retry 시 hint 블록 추가 방식
+- 토큰 예산에 따른 블록 우선순위 (context 압축 순서)
+
+### Credential 노출 방지
+
+Context에 포함되는 파일이 민감 정보를 담고 있을 수 있다.
+
+- deny_context_paths 설정: `.env`, `*secret*`, `*credential*` 등 패턴 매칭
+- 파일 선택 단계에서 deny 목록 필터링 (LLM에 전달 전 차단)
+- 선택된 파일에 고엔트로피 문자열(API key 패턴) 포함 시 경고
+
+> Context가 LLM에 전송되는 순간 외부로 나간다.
+> 파일 선택 단계가 마지막 방어선이다.
+
+### 프롬프트 엔지니어링 전략
+
+#### 출력 형식 강제
+- system prompt에 JSON schema 전체를 포함 (구조 명세)
+- `respond ONLY with valid JSON` 패턴 — markdown 감싸기 방지
+- 허용 필드 외 필드가 포함되면 CH03 파싱 단계에서 거부된다는 전제로 설계
+
+#### Few-shot 예시
+- plan 생성 prompt에 (요청 → plan.md) 예시 1쌍 고정 삽입
+- 예시는 실제 성공한 케이스 기반 (testdata/plans/safe_plan.md 재활용)
+- 토큰 예산 초과 시 few-shot 블록을 가장 먼저 축소 (압축 우선순위)
+
+#### Retry Hint 설계
+- 첫 번째 시도: hint 없음
+- SYNTAX 에러 retry: 실패한 출력의 어디가 틀렸는지를 task 블록에 추가
+  ```
+  [이전 시도 실패]
+  에러: unexpected token at line 3
+  잘못된 출력 (앞 200자): ...
+  수정 후 다시 시도하세요.
+  ```
+- TRANSIENT retry: hint 없이 동일 prompt 재전송
+
+#### 결정론성 확보
+- temperature=0 고정 (plan/apply 단계) — diff 출력은 창의성 불필요
+- top_p / top_k 기본값 사용하지 않고 명시
+- 동일 요청에 동일 출력을 기대하는 테스트는 temperature=0 전제
+
+### Context 선택 알고리즘
+
+"관련 파일만 선택해서 context 크기를 줄인다"는 목표가 있지만, 토큰이 부족할 때 **무엇을 어떻게 자르는가**가 실제 구현에서 가장 어려운 문제다.
+
+**파일 관련성 점수 산출**
+
+```go
+type FileScore struct {
+    Path     string
+    Score    float64 // 높을수록 우선 포함
+    Tokens   int
+}
+
+func scoreFile(path string, request string) FileScore {
+    score := 0.0
+
+    // 1. 파일명이 요청 키워드와 일치
+    if containsKeyword(filepath.Base(path), request) {
+        score += 3.0
+    }
+
+    // 2. 최근 수정 파일 우선 (git log 기준)
+    if isRecentlyModified(path) {
+        score += 1.0
+    }
+
+    // 3. 파일 크기 페널티 (같은 점수면 작은 파일 우선)
+    score -= float64(estimateTokens(path)) * 0.001
+
+    return FileScore{Path: path, Score: score, Tokens: estimateTokens(path)}
+}
+```
+
+> 점수 산출은 단순할수록 좋다. 의미론적 유사도(embedding)는 별도 API 호출이 필요하므로
+> 이 프로젝트에서는 파일명 + 최근 수정 + 크기 페널티의 휴리스틱으로 대체한다.
+
+**토큰 초과 시 축소 순서**
+
+예산이 부족할 때 블록을 제거하는 우선순위:
+
+```
+1순위 제거: few-shot 예시 블록 (가장 크고 재현 가능)
+2순위 제거: 관련성 점수 하위 파일부터 순서대로
+3순위 제거: 파일 내용을 부분만 포함 (앞 N줄)
+4순위: CLAUDE.md / system prompt는 절대 제거하지 않음
+```
+
+```go
+func (b *ContextBuilder) fitInBudget(blocks []PromptBlock, budget int) []PromptBlock {
+    total := sumTokens(blocks)
+    if total <= budget {
+        return blocks
+    }
+
+    // 1단계: few-shot 제거
+    blocks = removeFewShot(blocks)
+    if sumTokens(blocks) <= budget {
+        return blocks
+    }
+
+    // 2단계: 관련성 낮은 파일 제거
+    blocks = dropLowScoreFiles(blocks, budget)
+    if sumTokens(blocks) <= budget {
+        return blocks
+    }
+
+    // 3단계: 남은 파일 앞 N줄만 유지
+    return truncateFileBlocks(blocks, budget)
+}
+```
+
+**파일 부분 포함 시 잘리는 위치**
+
+파일을 앞 N줄만 포함할 경우 중간에 잘렸다는 표시를 반드시 붙인다:
+
+```
+// [파일: utils.go — 토큰 초과로 앞 50줄만 포함됨]
+func Foo() {
+    ...
+}
+// [이하 생략]
+```
+
+> 표시 없이 잘리면 LLM이 파일이 완전하다고 가정하고 존재하지 않는 함수를 참조하는 diff를 생성한다.
+
+### 완료 기준
+- [I] CLAUDE.md를 로드해서 context에 포함한다
+- [I] 파일 목록에서 관련 파일만 선택해서 context 크기를 줄인다
+- [U] rule 충돌 시 우선순위 기준으로 하나가 선택된다
+- [U] system / context / task 블록이 분리된 템플릿으로 구성된다
+- [I] deny_context_paths에 매칭되는 파일은 context에 포함되지 않는다
+- [U] system prompt에 JSON schema가 포함되고, 이를 벗어난 출력이 CH03에서 거부된다
+- [U] retry 시 hint 블록이 task 블록에 추가되어 다음 호출에 전달된다
+- [M] temperature=0으로 고정된 plan/apply 호출에서 동일 입력 → 동일 출력이 golden file 테스트로 검증된다
+- [U] 토큰 예산 초과 시 few-shot → 저관련성 파일 → 파일 부분 포함 순서로 축소된다
+- [I] 파일이 잘려서 포함될 경우 프롬프트 내에 잘림 표시가 포함된다
+- [I] deny_context_paths에 매칭된 파일은 점수 산출 대상에서 제외된다
+
+---
+
+## CH05. Plan 생성 + Plan Gate
+
+- plan.md 구조
+- target file 지정
+- step 분해
+- done criteria
+
+### Plan Gate
+- 파일 존재 검증
+- 범위 검증
+- 위험 작업 필터링 — 정책은 외부 설정 파일로 분리
+  - deny_paths: go.mod, go.sum, .github/** 등
+  - deny_ops: delete, rename 등
+  - on_violation: abort 또는 confirm
+- Gate 코드는 정책을 로드해 검증만 수행, 기준 변경 시 설정 파일만 수정
+
+### Prompt Injection 방어
+
+LLM이 생성한 plan이 하네스 자체의 동작을 변경하려는 내용을 포함할 수 있다.
+
+- plan의 target file이 하네스 자신의 소스를 가리키는 경우 거부
+- plan step에 시스템 명령 패턴(`rm -rf`, `curl | sh` 등) 포함 시 거부
+- plan 출처가 사용자 요청이 아닌 LLM 자체 생성임을 명시적으로 표기
+
+> plan.md는 LLM이 작성한 문서다. 사용자 의도와 다른 내용이 삽입될 수 있다.
+> Gate는 plan의 내용을 신뢰하지 않는 전제로 검증한다.
+
+### 완료 기준
+- [I] LLM 응답으로부터 plan.md를 생성한다
+- [U] deny_paths에 포함된 파일을 대상으로 한 plan은 gate에서 거부된다
+- [U] deny_ops에 해당하는 작업이 on_violation 정책에 따라 처리된다
+- [U] 하네스 자신의 소스 파일을 target으로 하는 plan이 거부된다
+- [U] plan step에 시스템 명령 패턴이 포함된 경우 gate에서 차단된다
+
+---
+
+## CH06. Patch Apply Engine ⭐
+
+### 적용 방식: unified diff + AST 검증 분리
+
+- LLM 출력 형식: unified diff
+- Apply: go-gitdiff 라이브러리로 파싱 후 적용
+- AST 역할: syntax 검증 전용 (파싱 성공 여부만 확인)
+- 포매팅: gofmt 후처리
+- rollback: apply 전 원본 파일 백업, 실패 시 복원
+- FileMeta (EOL / encoding) 보존
+
+> AST 기반 function replace는 사용하지 않는다.
+> comment association 비결정성 및 포매팅 파괴 문제로 인해 unified diff 방식으로 대체.
+
+### Hook 인터페이스 (이 챕터에서 stub 정의)
+
+Apply Engine이 pre/post hook 슬롯을 가지되, 실제 구현은 CH08에서 교체.
+CH06에서는 아무것도 하지 않는 NoopHook으로 연결.
+
+### 파일 시스템 원자성
+
+단순 백업(.bak) 방식은 apply 도중 crash 시 파일이 손상된 상태로 남는다.
+
+**왜 단순 백업이 불충분한가**
+
+```
+1) file.go 읽기
+2) file.go.bak 복사         ← crash → .bak만 남음
+3) 패치 적용 후 덮어쓰기      ← crash → file.go 반쯤 쓰인 상태
+4) 성공 → .bak 삭제
+```
+
+3번 중간에 crash가 나면 `file.go`는 복구 불가능한 상태가 된다.
+
+**Atomic Replace 패턴**
+
+```go
+func atomicWrite(path string, content []byte) error {
+    dir := filepath.Dir(path)
+    // 반드시 같은 파티션에 임시 파일 생성 (cross-device rename 방지)
+    tmp, err := os.CreateTemp(dir, ".tmp-*")
+    if err != nil {
+        return err
+    }
+    tmpPath := tmp.Name()
+
+    if _, err := tmp.Write(content); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+    if err := tmp.Close(); err != nil {
+        os.Remove(tmpPath)
+        return err
+    }
+
+    // os.Rename은 POSIX에서 atomic
+    // 실패해도 원본 파일은 손상되지 않는다
+    return os.Rename(tmpPath, path)
+}
+```
+
+**Rollback 설계**
+
+- apply 전 원본 내용을 메모리에 보관 (파일이 작은 경우)
+- 파일이 큰 경우 임시 디렉터리에 스냅샷 저장 후 atomic write로 복원
+- `.bak` 파일을 작업 디렉터리에 남기지 않는다
+- rollback 자체도 atomic write를 사용한다
+
+> cross-device rename이 발생하면 os.Rename이 에러를 반환한다.
+> 임시 파일은 반드시 대상 파일과 동일한 파티션(같은 디렉터리)에 생성해야 한다.
+
+### 멀티파일 Rollback: Transaction Log
+
+단일 파일 atomic write는 개별 파일을 보호한다. plan이 여러 파일을 수정할 때는 파일 간 일관성을 별도로 보장해야 한다.
+
+**문제 상황**
+
+```
+Plan: A.go 수정, B.go 수정, C.go 수정
+실행: A.go 성공 → B.go 성공 → C.go 실패
+결과: A, B는 수정됐고 C는 원본. 코드 컴파일 불가.
+```
+
+**Transaction Log 구조**
+
+```go
+type TxEntry struct {
+    Path     string `json:"path"`
+    Original []byte `json:"original"` // apply 전 원본 (nil이면 신규 파일)
+    Applied  bool   `json:"applied"`
+}
+
+type ApplyTransaction struct {
+    ID      string    `json:"id"`
+    Entries []TxEntry `json:"entries"`
+    State   string    `json:"state"` // "prepared" | "committed" | "rolled_back"
+}
+```
+
+**실행 흐름**
+
+```
+1. txlog 파일 생성 (state: "prepared")
+   - 수정 대상 파일 목록 + 각 파일의 현재 내용을 txlog에 저장
+
+2. 각 파일 apply (atomic write)
+   - 성공할 때마다 해당 entry의 Applied = true 로 txlog 갱신
+
+3. 모두 성공 → state: "committed" → txlog 삭제
+
+4. 실패 → Applied=true 인 파일들을 Original 내용으로 atomic write (rollback)
+          → state: "rolled_back" → txlog 삭제
+```
+
+**Crash 복구**
+
+```go
+func (e *ApplyEngine) RecoverIfNeeded(dir string) error {
+    txlogPath := filepath.Join(dir, ".harness.txlog")
+    data, err := os.ReadFile(txlogPath)
+    if os.IsNotExist(err) {
+        return nil // 정상 상태
+    }
+
+    var tx ApplyTransaction
+    if err := json.Unmarshal(data, &tx); err != nil {
+        return fmt.Errorf("corrupt txlog at %s: manual recovery required", txlogPath)
+    }
+
+    switch tx.State {
+    case "committed":
+        os.Remove(txlogPath)
+        return nil
+    case "prepared", "rolled_back":
+        // 불완전한 apply 또는 중단된 rollback → rollback 재실행
+        return e.rollbackTransaction(tx)
+    }
+    return nil
+}
+```
+
+> txlog는 작업 디렉터리 루트에 `.harness.txlog`로 생성한다.
+> `.gitignore`에 포함 권장. 정상 종료 시 반드시 삭제한다.
+
+### 크로스플랫폼 Atomic Rename
+
+`os.Rename`은 POSIX에서만 atomic이다. Windows에서 대상 파일이 이미 존재하면 `os.Rename`이 에러를 반환한다. 빌드 태그로 플랫폼별 구현을 분리한다.
+
+**파일 구조**
+
+```
+internal/atomic/
+├── rename_unix.go    // Linux, macOS (!windows 태그)
+└── rename_windows.go // Windows
+```
+
+```go
+//go:build !windows
+// rename_unix.go
+
+package atomic
+
+import "os"
+
+// os.Rename은 POSIX 보장: 대상 파일이 있어도 atomic replace
+func Rename(src, dst string) error {
+    return os.Rename(src, dst)
+}
+```
+
+```go
+//go:build windows
+// rename_windows.go
+
+package atomic
+
+import "golang.org/x/sys/windows"
+
+// MoveFileEx + MOVEFILE_REPLACE_EXISTING = atomic replace on Windows
+func Rename(src, dst string) error {
+    srcPtr, err := windows.UTF16PtrFromString(src)
+    if err != nil {
+        return err
+    }
+    dstPtr, err := windows.UTF16PtrFromString(dst)
+    if err != nil {
+        return err
+    }
+    return windows.MoveFileEx(srcPtr, dstPtr,
+        windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH,
+    )
+}
+```
+
+`atomicWrite`는 플랫폼 무관하게 동일한 코드를 사용하고 `atomic.Rename`만 호출한다.
+
+**macOS 추가 고려사항**
+
+macOS에서 `os.Rename`은 HFS+ 볼륨에서 동일 파티션 내에서만 atomic이 보장된다. `/tmp`와 프로젝트 디렉터리가 다른 볼륨에 있을 경우 cross-device rename 에러가 발생한다. 임시 파일을 반드시 대상 파일과 동일한 디렉터리에 생성하는 이유가 이것이다.
+
+**CI 검증**
+
+플랫폼 분기 코드는 해당 OS에서만 테스트 가능하다. GitHub Actions matrix로 두 OS 모두 검증한다:
+
+```yaml
+strategy:
+  matrix:
+    os: [ubuntu-latest, macos-latest, windows-latest]
+```
+
+### 완료 기준
+- [I] unified diff 형식의 LLM 출력을 파싱해서 파일에 적용한다
+- [I] AST syntax 검증 실패 시 apply를 거부한다
+- [I] apply 실패 시 원본 파일로 rollback된다
+- [U] NoopHook이 pre/post 슬롯에 연결되어 있다
+- [I] 패치 적용 도중 에러가 발생해도 원본 파일이 손상되지 않는다
+- [I] rollback 완료 후 임시 파일이 남지 않는다
+- [I] plan 적용 전 txlog가 생성된다
+- [I] 파일 A 적용 성공 후 파일 B 실패 시, A가 원본으로 rollback된다
+- [I] rollback 도중 crash 후 재실행 시 자동으로 rollback을 재개한다
+- [I] 정상 완료 후 txlog가 삭제된다
+- [I] txlog가 손상된 경우 복구 불가 에러와 함께 수동 처리를 안내한다
+- [I] macOS와 Windows 모두에서 atomic write가 동작한다
+- [I] Windows에서 대상 파일이 이미 존재해도 atomic replace가 성공한다
+
+---
+
+## CH07. Verify + Retry State Machine
+
+### 상태 전이
+
+    [Apply 완료]
+         │
+         ▼
+      [Verify]
+      /      \
+    PASS    FAIL
+     │        │
+    [Done]  [error 분류]
+              /        \
+        TRANSIENT    PERMANENT
+            │              │
+       [Retry N회]      [Abort]
+            │
+         [Verify]
+            │
+      retry >= limit
+            │
+          [Abort]
+
+### Error 분류 기준
+
+| ErrorClass | 조건 예시 | 동작 |
+|---|---|---|
+| TRANSIENT | connection refused, timeout | retry |
+| SYNTAX | syntax error, parse fail | retry + hint 추가 |
+| PERMANENT | undefined symbol, type mismatch | abort |
+
+### Abort 조건 (명시)
+- retry >= MaxRetry (기본 3회)
+- 동일 error signature 연속 2회 → 무한루프 방지 abort
+
+### Error Signature 비교
+
+error signature는 에러 메시지에서 위치 정보(라인 번호, 파일명)를 제거한 정규화된 문자열이다. "같은 에러가 반복되는가"를 판단하기 위해 사용한다.
+
+**왜 원본 메시지를 그대로 비교하면 안 되는가**
+
+```
+# retry 1 실패 메시지
+./main.go:42: undefined: Foo
+
+# retry 2 실패 메시지 (같은 에러지만 라인이 바뀜)
+./main.go:47: undefined: Foo
+```
+
+원본 메시지를 비교하면 다른 에러로 판단해 무한 retry가 발생한다.
+
+**Signature 추출 규칙**
+
+```go
+var (
+    lineNumPattern  = regexp.MustCompile(`:\d+:`)   // :42: → :N:
+    columnPattern   = regexp.MustCompile(`:\d+\s`) // :12 → :N
+    filePathPattern = regexp.MustCompile(`\S+\.go`) // 파일명 제거
+)
+
+func extractSignature(errMsg string) string {
+    s := lineNumPattern.ReplaceAllString(errMsg, ":N:")
+    s = columnPattern.ReplaceAllString(s, ":N ")
+    // 앞 200자만 사용 (비정상적으로 긴 메시지 대응)
+    if len(s) > 200 {
+        s = s[:200]
+    }
+    return strings.TrimSpace(s)
+}
+```
+
+**비교 방식: prefix match**
+
+전체 메시지가 아닌 앞부분(signature)만 비교한다. 에러 메시지 끝에 추가되는 hint나 stack trace는 비교에서 제외된다.
+
+```go
+type RetryState struct {
+    lastSignature string
+    consecutiveCount int
+}
+
+func (s *RetryState) record(err error) bool {
+    sig := extractSignature(err.Error())
+    if strings.HasPrefix(sig, s.lastSignature) || s.lastSignature == sig {
+        s.consecutiveCount++
+    } else {
+        s.consecutiveCount = 1
+        s.lastSignature = sig
+    }
+    return s.consecutiveCount >= 2 // true = abort
+}
+```
+
+**예시**
+
+| retry | 에러 메시지 | signature | 연속 횟수 | abort? |
+|---|---|---|---|---|
+| 1 | `./main.go:42: undefined: Foo` | `undefined: Foo` | 1 | no |
+| 2 | `./main.go:47: undefined: Foo` | `undefined: Foo` | 2 | **yes** |
+| 1 | `./main.go:42: undefined: Foo` | `undefined: Foo` | 1 | no |
+| 2 | `./main.go:42: cannot use Bar` | `cannot use Bar` | 1 | no (다른 에러) |
+
+> SYNTAX 에러의 경우 retry 시 prompt에 hint를 추가한다 (CH03). hint가 효과가 없으면 signature가 동일하게 유지되므로 2회 연속 후 자동 abort된다.
+
+### 포함
+- test / lint 실행
+- failure classification
+- error signature 추출 및 비교 (정규화 → prefix match)
+- retry limit
+- abort 조건
+
+### 완료 기준
+- [U] verify 성공 시 Done으로 전이된다
+- [M] TRANSIENT 에러에서 retry가 동작하고 MaxRetry 초과 시 abort된다
+- [U] PERMANENT 에러에서 즉시 abort된다
+- [U] 동일 error signature 2회 연속 시 abort된다
+
+---
+
+## CH08. Hook / Policy (Control 컴포넌트)
+
+CH06에서 정의한 Hook 인터페이스의 실제 구현체를 여기서 작성.
+
+- pre hook 구현
+- post hook 구현
+- abort / pause / override 강제 실행 정책
+- Control: 실행 흐름 중단 및 재개 조건
+
+### PolicyHook 구현
+
+```go
+type PolicyHook struct {
+    cfg HookConfig
+}
+
+type HookConfig struct {
+    PreChecks  []CheckFunc  // apply 전 실행 순서대로
+    PostChecks []CheckFunc  // apply 후 실행 순서대로 (성공/실패 무관)
+    OnViolation string      // "abort" | "warn"
+}
+
+type CheckFunc func(ctx context.Context, plan Plan) error
+```
+
+pre hook은 체인으로 실행된다. 하나라도 에러를 반환하면 이후 체크는 실행하지 않고 즉시 전파한다.
+
+```go
+func (h *PolicyHook) Pre(ctx context.Context, plan Plan) error {
+    for _, check := range h.cfg.PreChecks {
+        if err := check(ctx, plan); err != nil {
+            if h.cfg.OnViolation == "abort" {
+                return &HarnessError{Class: ErrorClassPermanent, Stage: "pre-hook", Wrapped: err}
+            }
+            slog.Warn("hook.pre.violation", "err", err)
+        }
+    }
+    return nil
+}
+```
+
+post hook은 apply 성공/실패 무관하게 전부 실행한다. 개별 체크 에러는 로그에만 기록하고 전파하지 않는다 (cleanup 목적이므로).
+
+### Abort / Pause / Override 정책
+
+**Abort 조건 (즉시 중단)**
+
+| 조건 | 발생 위치 | 설명 |
+|---|---|---|
+| pre hook PERMANENT 에러 | apply 전 | 정책 위반, 복구 불가 |
+| Gate 거부 (CH05) | plan 이후 | deny_paths / deny_ops 위반 |
+| budget 초과 (CH12) | API 호출 전 | `on_exceed: abort` 설정 시 |
+| retry >= MaxRetry (CH07) | verify 이후 | 무한 루프 방지 |
+| 동일 error signature 2회 연속 (CH07) | verify 이후 | 진전 없는 반복 방지 |
+
+**Pause 조건 (대기 후 재개)**
+
+| 조건 | 재개 트리거 |
+|---|---|
+| 429 rate limit (CH03) | Retry-After 대기 완료 |
+| rate limiter 토큰 고갈 (CH12) | 토큰 보충 완료 |
+
+> Pause는 ctx cancel로 중단 가능하다. SIGINT 수신 시 대기 중인 hook도 취소된다.
+
+**Override 정책**
+
+정책상 abort가 발생해야 하는 상황을 사용자가 강제로 통과시킬 수 있다.
+
+```go
+type OverridePolicy struct {
+    AllowDenyPaths bool // deny_paths 무시
+    AllowDenyOps   bool // deny_ops 무시
+    MaxRetryBump   int  // MaxRetry를 이 값으로 임시 상향
+}
+```
+
+- override는 CLI 플래그 `--override-policy`로만 활성화
+- override 활성화 시 `slog.Warn`으로 반드시 기록
+- 코드 레벨에서 override를 hardcode하지 않는다
+
+### 완료 기준
+- [U] pre hook이 apply 전에 실행되고, 체인 중 에러 발생 시 이후 체크가 실행되지 않는다
+- [U] post hook이 apply 후 (성공/실패 무관) 전부 실행된다
+- [U] `OnViolation: abort` 설정 시 pre hook 에러가 `ErrorClassPermanent`로 래핑된다
+- [U] `OnViolation: warn` 설정 시 pre hook 에러가 로그에만 기록되고 실행이 계속된다
+- [U] abort 조건 5가지 각각이 해당 위반 상황에서 실행을 중단시킨다
+- [U] override 플래그 없이는 abort 조건이 우회되지 않는다
+- [U] override 활성화 시 slog.Warn이 기록된다
+
+---
+
+## CH09. Skill
+
+재사용 가능한 작업 단위. LLM 호출 없이 실행 가능한 고정 로직을 캡슐화한다.
+
+### Skill vs Tool 구분
+
+| | Skill (CH09) | Tool (CH10 MCP) |
+|---|---|---|
+| 실행 위치 | 하네스 내부 | 외부 시스템 연결 |
+| 등록 방식 | 코드에서 registry.Register | MCP 프로토콜로 동적 등록 |
+| 신뢰 수준 | 하네스가 직접 구현 → 높음 | 외부 응답 → LLM 출력과 동일 수준 |
+| 예시 | `file.read`, `shell.run` | GitHub API, DB 조회 |
+
+Skill은 하네스가 직접 구현한 내부 로직이다. Tool은 외부 시스템과의 연결이며 응답을 신뢰할 수 없다.
+
+### Skill 구조
+
+```
+Skill
+├── Name       string          // registry 조회 키
+├── Input      Schema          // 입력 필드 정의 + 유효성 검증 규칙
+├── Output     Schema          // 출력 필드 정의
+└── Execute    func(Input) Output
+```
+
+### Skill Registry
+
+- 이름 → 구현체 매핑 (map[string]Skill)
+- 등록: `registry.Register(skill)`
+- 조회: `registry.Get(name)` — 없으면 에러 반환
+- 중복 등록 시 패닉 (초기화 시점에 발견되어야 함)
+
+### 입출력 유효성 검증
+
+- 호출 전: Input 스키마 검증 (필수 필드, 타입)
+- 호출 후: Output 스키마 검증 (계약 위반 감지)
+- 검증 실패는 실행 에러와 구분된 SkillValidationError로 분류
+
+### CH15와 역할 분리
+
+| | CH09 | CH15 |
+|---|---|---|
+| 관심사 | 단일 skill 실행 계약 | skill registry 운영 (등록/조회/목록) |
+| 범위 | skill 인터페이스 + 검증 | 다수 skill 관리 및 Flow 연결 |
+
+### Flow와의 연결
+
+plan step에 `type` 필드를 추가해 LLM 호출 없이 skill을 직접 실행할 수 있다.
+
+```go
+type StepType string
+
+const (
+    StepTypeLLM   StepType = "llm"
+    StepTypeSkill StepType = "skill"
+)
+
+type PlanStep struct {
+    Type   StepType       // "llm" | "skill"
+    Skill  string         // type=skill일 때 registry 조회 키
+    Input  map[string]any // skill 입력
+    Target string         // type=llm일 때 대상 파일
+}
+```
+
+Flow(CH13)에서 step을 실행할 때:
+
+```
+[PlanStep 실행]
+      │
+      ├── type = "llm"   → Claude API 호출 → Apply Engine
+      └── type = "skill" → registry.Get(name) → Execute(input)
+```
+
+> skill step은 LLM 호출과 Apply를 건너뛰므로 observability에서도 별도 분기로 기록한다.
+
+### Execute 실패 분류
+
+skill 실행 실패는 두 가지로 구분한다.
+
+| 실패 유형 | 설명 | 에러 타입 |
+|---|---|---|
+| 검증 실패 | Input/Output 스키마 불일치 | `SkillValidationError` |
+| 실행 실패 | Execute 내부 에러 | `HarnessError` (CH01) |
+
+`SkillValidationError`는 skill 계약 위반이므로 PERMANENT로 분류 → retry 없이 즉시 abort.
+
+```go
+type SkillValidationError struct {
+    SkillName string
+    Field     string // 어떤 필드가 문제인지
+    Reason    string
+}
+
+func (e *SkillValidationError) Error() string {
+    return fmt.Sprintf("skill[%s].%s: %s", e.SkillName, e.Field, e.Reason)
+}
+```
+
+### 멱등성 계약
+
+skill은 멱등적이어야 한다. 같은 Input으로 두 번 호출해도 시스템 상태가 동일해야 한다. 멱등성을 보장할 수 없는 skill은 등록 시 `Idempotent: false`로 표시한다.
+
+```go
+type Skill struct {
+    Name       string
+    Idempotent bool       // false = 실패 시 retry 금지
+    Input      Schema
+    Output     Schema
+    Execute    func(ctx context.Context, input Input) (Output, error)
+}
+```
+
+> `Idempotent: false` skill이 실패하면 CH10의 비멱등 tool 처리와 동일하게 PERMANENT 처리한다.
+
+### 샘플 Skill 구현
+
+CH09에서 실제로 구현하는 skill 2개. 인터페이스 설계를 검증하고 테스트 작성 대상으로 사용한다.
+
+#### Skill 1: `file.read` — 파일 내용 읽기 (멱등)
+
+파일 경로를 받아 내용을 반환한다. LLM이 특정 파일을 Context 없이 직접 읽어야 할 때 사용한다.
+
+```go
+var FileReadSkill = Skill{
+    Name:       "file.read",
+    Idempotent: true,
+    Input: Schema{
+        "path": {Type: "string", Required: true}, // 읽을 파일 경로
+    },
+    Output: Schema{
+        "content": {Type: "string"}, // 파일 내용
+        "size":    {Type: "int"},    // 바이트 크기
+    },
+    Execute: func(ctx context.Context, input Input) (Output, error) {
+        path, _ := input["path"].(string)
+        data, err := os.ReadFile(path)
+        if err != nil {
+            return nil, &HarnessError{
+                Class:   ErrorClassPermanent, // 파일 없음 = 재시도 불가
+                Stage:   "skill/file.read",
+                Wrapped: err,
+            }
+        }
+        return Output{"content": string(data), "size": len(data)}, nil
+    },
+}
+```
+
+**이 skill이 보여주는 것**
+- Input 스키마 검증: `path` 없이 호출 시 Execute 전에 `SkillValidationError` 반환
+- 에러 분류: `os.ReadFile` 실패는 PERMANENT (파일 경로 오류는 retry로 해결 불가)
+- 멱등성: 동일 경로로 두 번 호출해도 파일 상태 변화 없음
+
+**테스트 케이스**
+```go
+// 정상: 존재하는 파일
+func TestFileReadSkill_HappyPath(t *testing.T) {
+    dir := t.TempDir()
+    path := filepath.Join(dir, "hello.txt")
+    os.WriteFile(path, []byte("hello"), 0644)
+
+    out, err := FileReadSkill.Execute(ctx, Input{"path": path})
+    require.NoError(t, err)
+    assert.Equal(t, "hello", out["content"])
+    assert.Equal(t, 5, out["size"])
+}
+
+// 실패: 존재하지 않는 파일 → PERMANENT 에러
+func TestFileReadSkill_NotFound(t *testing.T) {
+    _, err := FileReadSkill.Execute(ctx, Input{"path": "/nonexistent/file.txt"})
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+
+// Input 검증: path 누락 → Execute 전에 SkillValidationError
+func TestFileReadSkill_MissingInput(t *testing.T) {
+    err := registry.Execute(ctx, "file.read", Input{}) // path 없음
+    var ve *SkillValidationError
+    require.ErrorAs(t, err, &ve)
+    assert.Equal(t, "path", ve.Field)
+}
+```
+
+---
+
+#### Skill 2: `shell.run` — 쉘 명령 실행 (비멱등)
+
+allow-list에 등록된 명령만 실행한다. `go test`, `go vet` 등 Verify 단계 전 사전 검사나 빌드 자동화에 사용한다.
+
+```go
+var ShellRunSkill = Skill{
+    Name:       "shell.run",
+    Idempotent: false, // 같은 명령을 두 번 실행하면 사이드 이펙트 발생 가능
+    Input: Schema{
+        "command": {Type: "string", Required: true}, // 실행할 명령 (공백 구분)
+        "dir":     {Type: "string", Required: true}, // 작업 디렉터리
+    },
+    Output: Schema{
+        "stdout":   {Type: "string"},
+        "stderr":   {Type: "string"},
+        "exit_code":{Type: "int"},
+    },
+    Execute: func(ctx context.Context, input Input) (Output, error) {
+        raw, _ := input["command"].(string)
+        dir, _ := input["dir"].(string)
+
+        parts := strings.Fields(raw)
+        if !isAllowed(parts[0]) { // allow-list 검사
+            return nil, &HarnessError{
+                Class:   ErrorClassPermanent,
+                Stage:   "skill/shell.run",
+                Wrapped: fmt.Errorf("command not allowed: %s", parts[0]),
+            }
+        }
+
+        cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
+        cmd.Dir = dir
+        var stdout, stderr bytes.Buffer
+        cmd.Stdout, cmd.Stderr = &stdout, &stderr
+
+        err := cmd.Run()
+        exitCode := 0
+        if err != nil {
+            var exitErr *exec.ExitError
+            if errors.As(err, &exitErr) {
+                exitCode = exitErr.ExitCode()
+                // 프로세스 종료 자체는 에러가 아님 — exit code로 판단
+                return Output{
+                    "stdout": stdout.String(), "stderr": stderr.String(),
+                    "exit_code": exitCode,
+                }, nil
+            }
+            // exec 자체 실패 (명령 없음, 권한 등) → PERMANENT
+            return nil, &HarnessError{Class: ErrorClassPermanent, Stage: "skill/shell.run", Wrapped: err}
+        }
+        return Output{"stdout": stdout.String(), "stderr": stderr.String(), "exit_code": 0}, nil
+    },
+}
+
+// allow-list: 하드코드 + config deny-by-default
+var allowedCommands = map[string]bool{
+    "go":   true,
+    "make": true,
+}
+
+func isAllowed(cmd string) bool { return allowedCommands[cmd] }
+```
+
+**이 skill이 보여주는 것**
+- `Idempotent: false` 실패 시 retry 없이 abort되는 경로 검증 가능
+- allow-list 기반 보안: CH10의 쉘 명령 실행 tool과 동일 원칙을 skill 레벨에서 먼저 구현
+- exit code와 exec 에러를 구분하는 패턴 (exit code 1은 에러가 아닐 수 있다)
+
+**테스트 케이스**
+```go
+// 정상: 허용된 명령
+func TestShellRunSkill_Allowed(t *testing.T) {
+    out, err := ShellRunSkill.Execute(Input{
+        "command": "go version",
+        "dir":     t.TempDir(),
+    })
+    require.NoError(t, err)
+    assert.Equal(t, 0, out["exit_code"])
+}
+
+// 보안: allow-list 외 명령 → PERMANENT
+func TestShellRunSkill_Blocked(t *testing.T) {
+    _, err := ShellRunSkill.Execute(Input{
+        "command": "curl http://example.com",
+        "dir":     t.TempDir(),
+    })
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+
+// 비멱등: Idempotent=false skill 실패 시 registry가 retry 없이 abort
+func TestShellRunSkill_NonIdempotentAbort(t *testing.T) {
+    // registry.Execute가 Idempotent=false skill의 실패를 PERMANENT로 분류하는지 검증
+    err := registry.Execute("shell.run", Input{"command": "go build ./...", "dir": "/nonexistent"})
+    var he *HarnessError
+    require.ErrorAs(t, err, &he)
+    assert.Equal(t, ErrorClassPermanent, he.Class)
+}
+```
+
+---
+
+> 두 skill은 인터페이스 설계를 검증하기 위한 최소 구현이다.
+> 실제 유용한 skill (예: `git.commit`, `file.glob`, `json.query`)은 CH15 확장 단계에서 추가한다.
+> 이 챕터에서는 `file.read`(멱등 + PERMANENT 에러)와 `shell.run`(비멱등 + allow-list)으로 두 가지 설계 경로를 모두 검증하는 것이 목표다.
+
+### Execute ctx 전달 이유
+
+모든 공개 함수는 CH02에서 확립한 대로 첫 인자가 `ctx context.Context`다. Skill의 Execute도 동일하게 적용한다.
+
+1. `shell.run` Skill이 `exec.CommandContext(ctx, ...)`를 사용 → ctx 없이는 timeout/cancel 적용 불가
+2. CH08 abort (ctx cancel) 신호가 실행 중인 skill까지 전파되어야 한다
+3. CH14 multi-agent에서 agent cancel 시 실행 중인 skill도 즉시 중단되어야 한다
+
+`registry.Execute`도 ctx를 첫 인자로 받아 skill에 전달한다:
+
+```go
+func (r *Registry) Execute(ctx context.Context, name string, input Input) (Output, error) {
+    skill, ok := r.skills[name]
+    if !ok {
+        return nil, fmt.Errorf("skill not found: %s", name)
+    }
+    if err := skill.Input.Validate(input); err != nil {
+        return nil, &SkillValidationError{SkillName: name, ...}
+    }
+
+    out, err := skill.Execute(ctx, input)
+    if err != nil {
+        if !skill.Idempotent {
+            return nil, &HarnessError{Class: ErrorClassPermanent, ...}
+        }
+        return nil, err
+    }
+    return out, skill.Output.Validate(out)
+}
+```
+
+### 완료 기준
+- [U] skill을 정의하고 이름으로 registry에 등록할 수 있다
+- [U] 존재하지 않는 이름으로 조회 시 에러를 반환한다
+- [U] Input 스키마 검증 실패 시 실행 전에 `SkillValidationError`를 반환한다
+- [U] Output 스키마 검증 실패 시 `SkillValidationError`를 반환한다
+- [U] `SkillValidationError`는 PERMANENT로 분류되어 retry 없이 abort된다
+- [U] 동일 입력에 대해 동일 출력 계약이 보장된다 (멱등성)
+- [U] `Idempotent: false` skill이 실패하면 retry 없이 abort된다
+- [U] plan step의 type이 `skill`이면 LLM 호출 없이 registry에서 직접 실행된다
+- [U] skill step 실행이 observability(CH11)에 별도 stage로 기록된다
+- [I] `file.read` skill이 존재하지 않는 파일 경로에 대해 PERMANENT 에러를 반환한다
+- [U] `shell.run` skill이 allow-list 외 명령을 PERMANENT 에러로 차단한다
+- [U] `Idempotent: false`인 `shell.run` skill 실패 시 registry가 retry 없이 abort한다
+
+---
+
+## CH10. MCP / Tool Use
+
+- 외부 시스템 연결
+- tool execution은 하네스가 담당
+- credential: CH02의 API key 로드 패턴과 동일하게 통일
+
+### Tool 응답 신뢰 경계
+
+tool 응답은 LLM 출력과 동일한 신뢰 수준으로 처리한다. 외부 시스템이 악의적이거나 손상된 응답을 보낼 수 있다.
+
+- tool 응답도 CH03과 동일하게 스키마 검증 (허용 필드 외 unknown field 거부)
+- 응답 크기 상한 적용 (비정상적으로 큰 응답 차단)
+- 파싱 성공 ≠ 응답 신뢰
+
+### Tool 실행 옵션
+
+```go
+type ToolCallOption struct {
+    Timeout         time.Duration // 0 = 기본값 30s
+    MaxResponseSize int64         // 바이트 단위, 0 = 기본값 1MB
+    Idempotent      bool          // true = 실패 시 retry 허용
+}
+```
+
+- timeout 초과 시 context cancel → TRANSIENT 에러로 분류 (CH07 연결)
+- `Idempotent: false`인 tool은 retry 없이 즉시 PERMANENT 처리
+- 재시도 가능 여부는 tool 등록 시 명시
+
+### Tool 실행 격리
+
+- 파일 시스템 접근 tool은 CH05의 deny_paths 정책과 동일하게 적용
+- 쉘 명령 실행 tool은 allow-list 기반 허용만 (deny-by-default)
+- tool이 하네스 자신의 소스를 대상으로 접근하려 할 경우 거부 (CH05 Prompt Injection 방어와 동일 원칙)
+
+### Tool Use 실행 루프
+
+Claude API의 tool_use는 단일 호출이 아니라 멀티턴 루프다. 하네스가 루프를 직접 구동한다.
+
+```
+[API 호출] → stop_reason: "tool_use"
+      │
+      ▼
+[tool_use 블록 추출]
+  - id: "toolu_01abc..."
+  - name: "file.read"
+  - input: {"path": "main.go"}
+      │
+      ▼
+[하네스가 tool 실행] → registry.Execute(ctx, name, input)
+      │
+      ▼
+[tool_result 블록 구성]
+  - type: "tool_result"
+  - tool_use_id: "toolu_01abc..." ← id 매칭 필수
+  - content: 실행 결과
+      │
+      ▼
+[동일 conversation에 추가해 재호출]
+      │
+      ▼
+stop_reason: "end_turn" → 루프 종료
+```
+
+**tool_use / tool_result 블록 구조**
+
+```go
+type ToolUseBlock struct {
+    ID    string         `json:"id"`    // tool_result와 매칭용
+    Name  string         `json:"name"`
+    Input map[string]any `json:"input"`
+}
+
+type ToolResultBlock struct {
+    Type      string `json:"type"`        // "tool_result"
+    ToolUseID string `json:"tool_use_id"` // ToolUseBlock.ID와 동일해야 함
+    Content   string `json:"content"`
+    IsError   bool   `json:"is_error,omitempty"`
+}
+```
+
+**루프 구현 패턴**
+
+```go
+func (f *Flow) runWithTools(ctx context.Context, messages []Message) (string, error) {
+    for {
+        resp, err := f.client.Call(ctx, opt, messages)
+        if err != nil {
+            return "", err
+        }
+
+        switch resp.StopReason {
+        case "end_turn":
+            return resp.TextContent(), nil
+
+        case "tool_use":
+            toolUses := resp.ToolUseBlocks()
+            if len(toolUses) == 0 {
+                return "", &HarnessError{Class: ErrorClassSyntax, Stage: "tool_use",
+                    Wrapped: errors.New("stop_reason=tool_use but no tool_use blocks")}
+            }
+
+            // assistant 메시지 추가 (tool_use 블록 포함)
+            messages = append(messages, Message{Role: "assistant", Content: resp.Content})
+
+            // 모든 tool 실행 후 tool_result를 하나의 user 메시지로 묶어 추가
+            results := make([]ToolResultBlock, 0, len(toolUses))
+            for _, tu := range toolUses {
+                result, execErr := f.registry.Execute(ctx, tu.Name, tu.Input)
+                block := ToolResultBlock{
+                    Type:      "tool_result",
+                    ToolUseID: tu.ID,
+                    Content:   result,
+                    IsError:   execErr != nil,
+                }
+                results = append(results, block)
+            }
+            messages = append(messages, Message{Role: "user", Content: results})
+
+        default:
+            return "", &HarnessError{
+                Class:   ErrorClassPermanent,
+                Stage:   "tool_use",
+                Wrapped: fmt.Errorf("unexpected stop_reason: %s", resp.StopReason),
+            }
+        }
+    }
+}
+```
+
+**루프 종료 조건**
+
+| 조건 | 처리 |
+|---|---|
+| `stop_reason: end_turn` | 정상 종료 |
+| 루프 횟수 >= MaxToolRounds (기본 10) | PERMANENT abort |
+| 동일 tool + 동일 input 연속 2회 | CH07 signature 비교와 동일 원칙으로 abort |
+| ctx cancel | 즉시 종료 |
+
+### 완료 기준
+- [M] tool 호출 요청을 받아 실행하고 결과를 반환한다
+- [U] 외부 시스템 credential을 CH02와 동일한 방식으로 로드한다
+- [M] `stop_reason: tool_use` 수신 시 tool을 실행하고 결과를 `tool_result`로 재전달한다
+- [U] `tool_use_id`가 `tool_result.tool_use_id`와 매칭되지 않으면 에러를 반환한다
+- [M] `MaxToolRounds` 초과 시 PERMANENT 에러로 abort된다
+- [U] 동일 tool + 동일 input이 연속 2회 발생하면 무한루프로 판단해 abort된다
+- [M] 하나의 응답에 여러 tool_use 블록이 있을 때 모두 실행 후 단일 user 메시지로 묶어 재전달한다
+- [U] tool 응답이 허용 스키마를 벗어나면 거부된다
+- [U] tool 응답 크기가 상한을 초과하면 에러를 반환한다
+- [M] tool 실행이 timeout을 초과하면 취소되고 TRANSIENT로 분류된다
+- [U] 비멱등 tool은 실패 시 retry 없이 abort된다
+- [U] 파일 시스템 접근 tool이 deny_paths를 준수한다
+
+---
+
+## CH11. Observability
+
+- stage timing
+- token usage
+- retry count
+- failure tracking
+
+### Recorder 인터페이스 (OTel 호환 설계)
+
+CH11에서는 외부 라이브러리 없이 SpanRecorder로 구현하되, CH19에서 OpenTelemetry로 교체할 수 있도록 인터페이스를 OTel 호환 구조로 설계한다.
+
+```go
+// Flow에 주입되는 인터페이스 — CH19에서 OtelRecorder로 교체 가능
+type Recorder interface {
+    Record(ctx context.Context, stage string, fn func(ctx context.Context) error) error
+    Summary() []Span
+}
+```
+
+`Span` 구조체의 필드는 OTel Span과 동일하게 설계한다:
+
+```go
+type Span struct {
+    TraceID   string            // OTel TraceID 형식 호환
+    SpanID    string            // OTel SpanID 형식 호환
+    Stage     string            // OTel attribute: "stage"
+    StartedAt time.Time
+    Duration  time.Duration
+    Attrs     map[string]any    // OTel attributes 역할
+    Err       error
+}
+```
+
+> 이 구조로 설계하면 CH19에서 SpanRecorder를 OtelRecorder로 교체할 때
+> Flow 코드를 변경하지 않아도 된다.
+
+### SpanRecorder
+
+외부 라이브러리 없이 span 개념을 직접 구현한다. Flow의 각 stage를 `Record`로 감싸면 전체 실행 타임라인이 자동으로 수집된다.
+
+```go
+type Span struct {
+    Stage     string
+    StartedAt time.Time
+    Duration  time.Duration
+    TokensIn  int
+    TokensOut int
+    Err       error
+}
+
+type SpanRecorder struct {
+    mu    sync.Mutex
+    spans []Span
+}
+
+func (r *SpanRecorder) Record(stage string, fn func() error) error {
+    start := time.Now()
+    err := fn()
+    r.mu.Lock()
+    r.spans = append(r.spans, Span{
+        Stage:     stage,
+        StartedAt: start,
+        Duration:  time.Since(start),
+        Err:       err,
+    })
+    r.mu.Unlock()
+    return err
+}
+
+func (r *SpanRecorder) Summary() []Span {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    return slices.Clone(r.spans)
+}
+```
+
+CH13 Flow에서의 사용:
+
+```go
+err = recorder.Record("apply", func() error {
+    return applyEngine.Apply(ctx, patch)
+})
+err = recorder.Record("verify", func() error {
+    return verifier.Run(ctx)
+})
+```
+
+### 구조화 로깅 (slog)
+
+```go
+// stage 진입
+slog.Info("stage.start", "stage", "apply", "request_id", reqID)
+
+// stage 완료
+slog.Info("stage.done",
+    "stage", "apply",
+    "duration_ms", span.Duration.Milliseconds(),
+    "tokens_in", span.TokensIn,
+    "tokens_out", span.TokensOut,
+)
+
+// stage 실패
+slog.Error("stage.fail",
+    "stage", "apply",
+    "err", err,
+    "retry", retryCount,
+)
+```
+
+> slog 레벨(Debug/Info/Error)은 stage 결과에 따라 구분한다.
+> SpanRecorder는 CH13에서 Flow에 주입되어 전 단계를 커버한다.
+
+### Prompt Audit Trail
+
+Span은 타이밍과 메타데이터를 추적하지만 **실제로 LLM에 전송한 프롬프트와 받은 응답 원문**은 저장하지 않는다. 며칠 뒤 "왜 이 diff가 나왔지?"를 디버깅하려면 당시 프롬프트를 재현할 수 있어야 한다.
+
+**AuditLog 구조**
+
+```go
+type AuditEntry struct {
+    RequestID  string    // Span의 TraceID와 동일
+    Stage      string    // "plan" | "apply" | "retry/1" 등
+    Prompt     string    // LLM에 전송한 프롬프트 전문
+    Response   string    // LLM이 반환한 응답 원문
+    TokensIn   int
+    TokensOut  int
+    At         time.Time
+}
+
+type AuditLog interface {
+    Write(entry AuditEntry) error
+}
+```
+
+**저장 위치 및 형식**
+
+```
+.harness/
+└── audit/
+    └── 2026-04-01T15-04-05_request-id.jsonl  // 요청당 1파일, JSONL 형식
+```
+
+- 파일명에 timestamp + request_id 포함 → 정렬 가능, 중복 없음
+- JSONL 형식: 한 줄이 하나의 `AuditEntry` → 파일 손상 시 부분 복구 가능
+- retry가 발생하면 동일 파일에 여러 entry가 기록됨 (stage: "plan/retry/1")
+
+**민감 정보 처리**
+
+프롬프트에는 소스 코드와 환경 정보가 포함된다. audit log는 기본적으로 비활성화한다:
+
+```yaml
+observability:
+  audit:
+    enabled: false           # 기본 비활성화
+    path: ".harness/audit"
+    max_prompt_bytes: 65536  # 프롬프트 저장 상한 (초과 시 잘라서 저장)
+    retention_days: 7        # 이 기간 초과 파일 자동 삭제
+```
+
+> audit log는 디버깅 전용이다. CI 환경에서는 비활성화를 권장한다.
+> deny_context_paths에 매칭되어 context에서 걸러진 파일은 audit log에도 포함되지 않는다.
+
+**Flow에서의 기록 위치**
+
+```go
+// API 호출 직전/직후에 기록
+prompt := contextBuilder.Build(ctx, request)
+auditLog.Write(AuditEntry{
+    RequestID: RequestIDFrom(ctx),
+    Stage:     "plan",
+    Prompt:    prompt,
+    At:        time.Now(),
+})
+
+resp, err := client.Call(ctx, opt, prompt)
+auditLog.Write(AuditEntry{
+    RequestID: RequestIDFrom(ctx),
+    Stage:     "plan",
+    Response:  resp.RawText(),
+    TokensIn:  resp.Usage.InputTokens,
+    TokensOut: resp.Usage.OutputTokens,
+    At:        time.Now(),
+})
+```
+
+> AuditLog가 비활성화된 경우 `NoopAuditLog`를 주입한다 — Flow 코드는 변경 없음.
+
+### 완료 기준
+- [I] 각 stage(context / plan / apply / verify)의 소요 시간을 출력한다
+- [I] 요청별 token usage를 기록한다
+- [I] retry 횟수와 실패 유형을 추적한다
+- [I] 각 stage가 SpanRecorder를 통해 timing을 기록한다
+- [I] 실행 종료 후 전체 span 요약(stage / duration / err)을 출력할 수 있다
+- [U] slog 레벨(Debug/Info/Error)이 stage 결과에 따라 구분된다
+- [U] `Recorder` 인터페이스를 통해 SpanRecorder가 주입된다 (CH19 OTel 교체 준비)
+- [U] Span 구조체 필드가 OTel Span과 호환되는 형태로 설계된다
+- [I] `audit.enabled: true` 설정 시 LLM 호출 전후의 프롬프트와 응답 원문이 JSONL 파일로 저장된다
+- [I] audit log 파일명에 timestamp와 request_id가 포함되어 정렬 및 조회가 가능하다
+- [U] `audit.enabled: false`(기본값) 시 `NoopAuditLog`가 주입되어 Flow 코드 변경 없이 동작한다
+- [I] deny_context_paths에 걸러진 파일 내용은 audit log에도 포함되지 않는다
+
+---
+
+## CH12. Cost Control
+
+CH02에서 확보한 BudgetTokens 슬롯에 실제 로직 추가.
+
+- selective context
+- token budget 적용 (BudgetTokens 초과 시 abort 또는 context 축소)
+- cache
+- retry 제한
+- 모델 분리
+
+### Rate Limiting
+
+retry/backoff(CH03)는 에러 발생 후의 대응이다. Rate limiting은 에러 발생 전 속도 제어다. 두 레이어는 독립적으로 동작한다.
+
+**두 가지 Rate Limit 구분**
+
+| 종류 | 단위 | 제어 방법 | 설정 키 |
+|---|---|---|---|
+| Request/min | 요청 횟수 | token bucket | `budget.max_rpm` |
+| Token/min | 입출력 토큰 합 | sliding window | `budget.max_tpm` |
+
+config 추가:
+
+```yaml
+budget:
+  max_tokens: 0       # CH12 (0 = 제한 없음)
+  on_exceed: abort    # CH12
+  max_rpm: 0          # 분당 최대 요청 수 (0 = 제한 없음)
+  max_tpm: 0          # 분당 최대 토큰 수 (0 = 제한 없음)
+```
+
+**Token Bucket 구현**
+
+```go
+type RateLimiter struct {
+    mu         sync.Mutex
+    tokens     float64
+    maxTokens  float64
+    refillRate float64 // tokens/sec
+    lastRefill time.Time
+}
+
+func (r *RateLimiter) Wait(ctx context.Context) error {
+    for {
+        r.mu.Lock()
+        r.refill()
+        if r.tokens >= 1 {
+            r.tokens--
+            r.mu.Unlock()
+            return nil
+        }
+        wait := time.Duration((1-r.tokens)/r.refillRate * float64(time.Second))
+        r.mu.Unlock()
+
+        select {
+        case <-ctx.Done():
+            return ctx.Err() // ctx cancel 시 즉시 반환
+        case <-time.After(wait):
+        }
+    }
+}
+```
+
+API client 호출 전 `limiter.Wait(ctx)` 호출.
+
+**429 응답 처리와의 연계**
+
+- 429 수신 → `Retry-After` 헤더 파싱 → rate limiter의 refillRate를 해당 기간 동안 0으로 설정
+- 이후 요청들이 자동으로 대기 (CH03 backoff와 이중 보호)
+
+### 완료 기준
+- [U] BudgetTokens 초과 시 설정된 정책(abort / 축소)이 동작한다
+- [M] 저비용 모델과 고성능 모델이 작업 유형에 따라 분리 호출된다
+- [M] cache hit 시 API 호출이 발생하지 않는다
+- [M] 설정된 RPM 초과 시 요청이 대기한다
+- [M] 대기 중 ctx cancel 시 즉시 에러를 반환한다
+- [M] 429 수신 시 Retry-After 기간 동안 rate limiter가 일시적으로 중단된다
+
+---
+
+## CH13. 하네스 완성 (Flow 컴포넌트)
+
+Flow = plan → apply → verify 전체 실행 흐름을 조율하는 orchestrator.
+
+최소 구성:
+
+- API client
+- parser
+- context builder
+- plan gate
+- apply engine
+- verify / retry
+- hook
+- observability
+- cost control
+
+### CLI 인터페이스 설계
+
+모든 컴포넌트가 완성된 시점에 CLI 진입점을 설계한다.
+
+```
+agent-harness run --request "..."     // 단일 요청 실행
+agent-harness run --file request.txt  // 파일에서 요청 로드
+agent-harness plan --request "..."    // plan 생성까지만 실행 (dry-run)
+agent-harness apply --plan plan.md    // 기존 plan 적용
+```
+
+- 서브커맨드 구조 (cobra 또는 표준 flag)
+- 공통 플래그: `--config`, `--dry-run`, `--verbose`
+- 실행 결과는 stdout (JSON 또는 텍스트), 에러는 stderr
+- exit code: 0 = 성공, 1 = 실행 실패, 2 = 설정 오류
+
+> CLI는 Flow orchestrator의 얇은 래퍼다.
+> 비즈니스 로직이 CLI 레이어에 들어오지 않도록 Flow가 모든 결정을 담당한다.
+
+### Graceful Shutdown
+
+CH02에서 확립한 `context.Context` + cancel 패턴을 OS 신호와 연결한다.
+
+**신호 수신 → cancel 전파 흐름**
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+sigCh := make(chan os.Signal, 1)
+signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+go func() {
+    <-sigCh
+    cancel() // 전체 파이프라인에 전파
+}()
+
+err := flow.Run(ctx, request)
+```
+
+**각 단계별 중단 시점**
+
+| 단계 | 중단 가능 여부 | 중단 시 동작 |
+|---|---|---|
+| Context 구성 | 즉시 가능 | 파일 읽기 중단, 상태 없음 |
+| Plan 생성 | 즉시 가능 | 진행 중인 API 요청 취소 |
+| Apply 실행 | **불가** | rollback 완료 후 종료 |
+| Verify 실행 | 가능 | 실행 중인 프로세스 kill 후 종료 |
+
+**Apply 중 Shutdown 처리**
+
+Apply가 시작되면 context cancel을 무시하고 완료 또는 rollback까지 진행한다.
+
+```go
+// Apply는 부모 ctx가 cancel되어도 계속 실행
+applyCtx := context.WithoutCancel(ctx) // Go 1.21+
+
+err := applyEngine.Apply(applyCtx, patch)
+if err != nil {
+    // rollback은 반드시 완료 — Background context 사용
+    _ = applyEngine.Rollback(context.Background())
+}
+
+// Apply 완료 후 부모 ctx 상태 확인
+if ctx.Err() != nil {
+    return ctx.Err() // 지연된 종료
+}
+```
+
+**exit code 규칙**
+
+| 상황 | exit code |
+|---|---|
+| 정상 완료 | 0 |
+| 실행 실패 (apply 에러 등) | 1 |
+| 설정 오류 | 2 |
+| 신호 종료 (SIGINT/SIGTERM) | 130 |
+
+### 재실행 멱등성
+
+같은 요청으로 하네스를 두 번 실행했을 때 예측 가능한 결과가 나와야 한다. Ctrl+C 후 재실행, CI 재시도, 실수로 인한 중복 실행이 모두 해당된다.
+
+**작업 디렉터리 상태에 따른 동작 정의**
+
+실행 전 작업 디렉터리가 이전 실행으로 인해 오염되었을 수 있다.
+
+| 상태 | 의미 | 기본 동작 |
+|---|---|---|
+| txlog 존재 (`state: prepared` 또는 `rolled_back`) | 이전 apply가 중단됨 | rollback 완료 후 재실행 |
+| txlog 존재 (`state: committed`) | 정상 완료 후 미삭제 | txlog 삭제 후 재실행 |
+| git working tree dirty (txlog 없음) | 사용자가 직접 수정한 파일 있음 | 정책에 따라 결정 |
+| clean | 정상 상태 | 바로 실행 |
+
+**dirty workdir 정책**
+
+```yaml
+# config에 추가
+on_dirty_workdir: "abort"   # 기본값: 안전 우선
+# "abort"  — 실행 거부, 사용자에게 git status 확인 안내
+# "stash"  — git stash 후 실행, 완료 후 stash pop
+# "proceed" — 경고 로그만 출력하고 실행 (위험)
+```
+
+```go
+func (f *Flow) checkWorkdir(ctx context.Context) error {
+    // 1. txlog 복구 (CH06 RecoverIfNeeded 재활용)
+    if err := f.applyEngine.RecoverIfNeeded(f.workdir); err != nil {
+        return err
+    }
+
+    // 2. git working tree 상태 확인
+    dirty, err := f.gitStatus(ctx)
+    if err != nil || !dirty {
+        return err
+    }
+
+    switch f.cfg.OnDirtyWorkdir {
+    case "abort":
+        return &HarnessError{
+            Class:   ErrorClassPermanent,
+            Stage:   "preflight",
+            Wrapped: errors.New("working directory has uncommitted changes — commit or stash before running"),
+        }
+    case "stash":
+        if err := f.gitStash(ctx); err != nil {
+            return err
+        }
+        // Flow 완료 후 stash pop을 보장하는 cleanup 등록
+        f.cleanup = append(f.cleanup, func() { f.gitStashPop(context.Background()) })
+    case "proceed":
+        slog.Warn("preflight.dirty_workdir", "policy", "proceed")
+    }
+    return nil
+}
+```
+
+**request_id 기반 중복 실행 감지**
+
+동일한 request_id로 실행이 이미 진행 중이거나 완료된 경우를 감지한다.
+
+```
+.harness/
+└── runs/
+    └── {request_id}.lock   // 실행 중 존재, 완료 시 삭제
+```
+
+```go
+func (f *Flow) acquireLock(requestID string) (unlock func(), err error) {
+    lockPath := filepath.Join(f.workdir, ".harness/runs", requestID+".lock")
+    f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0644)
+    if os.IsExist(err) {
+        return nil, &HarnessError{
+            Class:   ErrorClassPermanent,
+            Stage:   "preflight",
+            Wrapped: fmt.Errorf("request %s is already running or completed", requestID),
+        }
+    }
+    return func() { os.Remove(lockPath) }, nil
+}
+```
+
+> `.harness/runs/` 디렉터리는 `.gitignore`에 추가한다.
+> lock 파일은 crash 후에도 남아 있을 수 있으므로 `--force` 플래그로 무시 가능하게 한다.
+
+### 완료 기준
+- [I] 사용자 요청 하나로 context 구성 → plan → gate → apply → verify 전 흐름이 단일 실행된다
+- [I] 각 단계 실패 시 정의된 정책(retry / abort / rollback)이 동작한다
+- [I] observability가 전 흐름에 걸쳐 기록된다
+- [I] `run` / `plan` / `apply` 서브커맨드가 동작한다
+- [I] `--dry-run` 플래그로 apply 없이 plan까지만 실행된다
+- [I] SIGTERM 수신 시 진행 중인 API 요청이 취소된다
+- [I] Apply 중 SIGTERM 수신 시 Apply가 완료(또는 rollback)된 후 종료된다
+- [I] exit code가 정상 종료(0)와 신호 종료(130)를 구분한다
+- [I] 실행 전 txlog가 존재하면 rollback을 완료한 후 재실행된다
+- [I] `on_dirty_workdir: abort` 설정 시 uncommitted changes가 있는 작업 디렉터리에서 실행이 거부된다
+- [I] `on_dirty_workdir: stash` 설정 시 실행 전 git stash, 완료 후 stash pop이 수행된다
+- [I] 동일 request_id로 중복 실행 시 PERMANENT 에러를 반환한다
+- [I] crash 후 남은 lock 파일을 `--force` 플래그로 무시하고 재실행할 수 있다
+
+---
