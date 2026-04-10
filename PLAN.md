@@ -85,12 +85,14 @@ agent-harness/
 - **`.harness/`**: txlog, audit, lock 저장
 - **테스트 태그**: `[U]` Unit / `[M]` Mock(httptest 등 fake 의존) / `[I]` Integration(실제 파일/프로세스)
 - **`.gitignore` 파싱**: `github.com/sabhiram/go-gitignore` 사용 (외부 의존성 테이블 참조)
+- **프로젝트 루트**: 탐색 순서 — `--root` 플래그 → CWD에서 상위로 `.git/` 탐색 → CWD. `config.yaml`, `.harness/`, `context.scan_root` 모두 이 루트 기준 상대 경로
 
 **`.harness/` 디렉터리 구조** (필수 파일. 구현 진행 시 추가)
 
 ```
 .harness/
 ├── lock.json          # 실행 중 잠금. {"request_id": "...", "pid": ..., "started_at": "RFC3339"}
+#                        staleness 판정: PID 생존 확인(os.FindProcess+signal 0) + started_at 1시간 초과 → stale lock 삭제 후 재획득
 ├── txlog.jsonl        # 트랜잭션 로그. 한 줄 = 한 이벤트
 └── audit/             # audit.enabled=true 시 LLM 호출 기록
     └── {timestamp}.jsonl
@@ -112,15 +114,15 @@ audit 레코드 형식:
 
 # Phase 1: Core — plan 생성까지
 
-**마일스톤**: `agent-harness plan --request "..."` → plan JSON 출력
+**마일스톤**: Plan 생성 파이프라인 통합 테스트 통과 (CLI는 Phase 3-3에서 추가)
 
-**검증 기준**:
-- 입력: `agent-harness plan --request "Add a Hello function to pkg/greet/greet.go that returns string"`
+**검증 기준** (통합 테스트 `TestPlanGeneration`):
+- 입력: request `"Add a Hello function to pkg/greet/greet.go that returns string"` + `testdata/project/`
 - 성공 조건:
-  1. stdout에 유효한 JSON 출력 (Plan schema 준수, `goal` + `steps[]` 존재)
+  1. 반환된 Plan 구조체가 schema 준수 (`goal` + `steps[]` 존재)
   2. steps에 target_files로 `pkg/greet/greet.go` 포함
-  3. exit code 0
-- 실패 조건: API key 미설정 시 exit code 2 + PERMANENT 에러 메시지
+  3. error nil
+- 실패 조건: API key 미설정 시 PERMANENT 에러 반환
 
 ---
 
@@ -172,6 +174,7 @@ version: "1"                    # string, 필수. 설정 스키마 버전
 api:
   model: ""                     # string, 필수. plan 생성용 모델 (e.g. "claude-sonnet-4-20250514")
   diff_model: ""                # string, 선택. diff 생성용 모델 (미설정 시 api.model 사용)
+  diff_context_window: 0        # int, 선택. diff_model의 context window (미설정 시 api.context_window 사용)
   max_retries: 3                # int, 기본 3. API 재시도 횟수
   context_window: 200000        # int, 기본 200000. 모델 context window 크기 (토큰)
 
@@ -221,7 +224,13 @@ flow:
 **테스트 인프라** (`testdata/`)
 
 - [ ] 테스트용 Go 프로젝트 구성
-  - `testdata/project/` 하위에 최소 Go 모듈 (go.mod + 간단한 .go 파일)
+  - `testdata/project/` 하위에 최소 Go 모듈:
+    - `go.mod` (module testproject)
+    - `pkg/greet/greet.go` (빈 패키지 또는 최소 함수)
+    - `CLAUDE.md` (context 포함 테스트용)
+  - `testdata/config/` 하위에 테스트용 config:
+    - `valid.yaml` (전 필드 설정)
+    - `minimal.yaml` (필수 필드만 — 기본값 적용 테스트)
   - Phase 1-4 통합 테스트(파일 선택, CLAUDE.md 포함)부터 사용
   - Phase 2 이후 diff 적용/검증 테스트에서도 재활용
 
@@ -236,9 +245,35 @@ flow:
 **LLMProvider 인터페이스** (`internal/api/`)
 
 - [ ] LLMProvider 인터페이스 정의
-  - `Call(ctx, []Message, CallOption) → (Response, error)` — 동기 호출
-  - `CallStream(ctx, []Message, CallOption) → (ResponseStream, error)` — 스트리밍
+  - `Call(ctx, []Message, CallOption) → (Response, error)` — 동기 호출. 내부적으로 `stream: false`
+  - `CallStream(ctx, []Message, CallOption) → (ResponseStream, error)` — 스트리밍. 내부적으로 `stream: true`. CallOption에 stream 필드 없음 (메서드 선택이 곧 스트림 제어)
   - 하네스 전체가 이 인터페이스에만 의존. provider 구현체는 생성자 주입
+
+```go
+// ResponseStream — 스트리밍 응답 소비 인터페이스
+type ResponseStream interface {
+    // Next: 다음 스트림 이벤트 반환. 스트림 종료 시 io.EOF
+    Next() (StreamEvent, error)
+    // Response: 스트림 완료 후 최종 Response 반환. Next가 io.EOF 반환 전 호출 시 에러
+    Response() (Response, error)
+    // Close: 스트림 리소스 해제. 중도 취소 시에도 반드시 호출
+    Close() error
+}
+
+// StreamEvent — 스트림 이벤트 (provider가 SSE 등을 이 타입으로 변환)
+type StreamEvent struct {
+    Type string // "text_delta" | "input_json_delta" | "content_block_stop" | "message_delta"
+    // text_delta
+    Text string
+    // input_json_delta
+    PartialJSON string
+    // content_block_stop: 확정된 ContentBlock
+    Block *ContentBlock
+    // message_delta: stop_reason + usage
+    StopReason string
+    Usage      *TokenUsage
+}
+```
 
 - [ ] 하네스 내부 공통 타입 (provider-agnostic)
   - `Message`, `ContentBlock`, `Response`, `TokenUsage` — 하네스 내부에서만 사용하는 중립적 구조
@@ -288,6 +323,7 @@ type TokenUsage struct {
 
 - [ ] Conversation
   - LLM API가 stateless라 매 호출마다 전체 히스토리 전송해야 함
+  - `System` 필드: `messages[]`와 별도로 관리. provider가 API 호출 시 자체 방식으로 전달 (Claude: `system` 파라미터, OpenAI: role "system" 메시지 등)
   - Append 메서드(User/Assistant/ToolResult), Shrink(히스토리 축소), EstimateTokens(토큰 근사)
   - **생명주기**: Flow의 llm step마다 새 Conversation 생성. tool use 멀티턴 루프 중에는 동일 Conversation에 누적. step 간에는 히스토리 미공유 (이전 step 변경 결과만 context로 전달)
 - [ ] CallOption
@@ -300,8 +336,12 @@ type TokenUsage struct {
   - Claude 전용 wire 타입(claude.Message, claude.Response 등) ↔ 공통 타입 변환
 - [ ] SSE 스트리밍 처리
   - `stream: true` 설정. SSE 파싱은 provider 내부에서 완결
-  - 이벤트별: message_start → content_block_start → delta(누적) → stop(확정) → message_stop → 공통 Response로 변환 반환
-  - `input_json_delta`는 불완전 JSON이므로 문자열 연결만, stop 시 한 번 파싱
+  - 이벤트 흐름: `message_start` → (`content_block_start` → `content_block_delta`* → `content_block_stop`)* → `message_delta` → `message_stop`
+    - `content_block_delta`: delta type 분기 — `text_delta`(텍스트 누적) / `input_json_delta`(tool 입력 JSON 누적)
+    - `content_block_stop`: 해당 블록 확정. `input_json_delta` 누적분은 이 시점에 한 번 JSON 파싱
+    - `message_delta`: `stop_reason` + 최종 `usage.output_tokens` 수신. 이거 안 받으면 stop_reason 판단 불가
+    - `message_stop`: 스트림 종료 신호
+  - `input_json_delta`는 불완전 JSON이므로 문자열 연결만, `content_block_stop` 시 한 번 파싱
   - 청크 경계: `\n\n` 기준 버퍼링, 불완전 라인은 다음 청크와 결합
   - 스트림 중단: EOF/timeout 시 완성된 text 블록은 반환, 미완성 tool_use는 폐기 + TRANSIENT 에러
 - [ ] API key 로드
@@ -349,9 +389,10 @@ type TokenUsage struct {
 **ContextBuilder** (`internal/context/`)
 
 - [ ] 프롬프트 3블록 조립
-  - system: 하네스 역할, 출력 형식(unified diff, JSON schema), 금지 행동 → Claude API `system` 파라미터
+  - system: 하네스 역할, 출력 형식(unified diff, JSON schema), 금지 행동 → Conversation.System에 저장
   - context: CLAUDE.md 내용, 선택된 파일 내용 → user 메시지 앞부분
   - task: 사용자 요청, plan(있으면), retry hint(있으면) → user 메시지 뒷부분
+  - **CLAUDE.md 탐색**: 프로젝트 루트 `CLAUDE.md` → 없으면 무시 (에러 아님). 존재 시 context 블록 최상단에 포함, 축소 대상에서 제외
 
 **System Prompt 템플릿** (필수 필드. 구현 진행 시 추가)
 
@@ -403,7 +444,7 @@ Please fix the failing test and regenerate the diff.
   - 선택 전략 (MVP): 명시적 지정(plan target) → 키워드 매칭(토큰 분리, 경로 매칭) → 초과 시 크기 작은 순
   - `deny_context_paths` 매칭 파일 제외 (.env, 시크릿 등)
 - [ ] context 축소
-  - 트리거: context 블록이 토큰 예산 × 80% 초과 시
+  - 트리거: context 블록이 config `api.context_window` × 80% 초과 시 (diff_model 사용 시 `api.diff_context_window` 기준)
   - 순서: few-shot 예시 제거 → 관련성 낮은 파일 제거 → 남은 파일 앞 N줄만 (잘림 표시 필수)
   - system prompt / CLAUDE.md는 절대 제거 안 함
 - [ ] Conversation 히스토리 축소
@@ -432,8 +473,21 @@ Please fix the failing test and regenerate the diff.
 
 - [ ] Plan 생성
   - LLM에 요청 → JSON 응답 → Plan 구조체. Step type: "llm"(diff 생성) / "skill"(registry 실행)
-  - 프롬프트에 JSON schema 전체 + "respond ONLY with valid JSON" + few-shot 예시 1쌍
+  - **structured output**: Plan schema를 tool의 `input_schema`로 정의하여 tool_use로 JSON 출력 강제. provider가 tool_use 미지원 시 fallback — 프롬프트에 JSON schema + "respond ONLY with valid JSON" + few-shot 예시 1쌍
   - Plan 생성 = 1회 LLM 호출(JSON). Diff 생성 = step마다 별도 LLM 호출(unified diff text) — 오케스트레이션은 Phase 3 Flow
+
+**Plan 생성용 Tool 정의** (LLM에 tool_use로 Plan JSON 출력을 강제하기 위한 tool)
+
+```json
+{
+  "name": "create_plan",
+  "description": "Create an execution plan for the user's request. Output the plan as structured JSON.",
+  "input_schema": <아래 Plan JSON Schema 그대로 사용>
+}
+```
+
+- LLM이 `create_plan` tool_use로 응답 → Input에서 Plan 구조체 추출
+- stop_reason이 `tool_use`가 아니거나 `create_plan` 외 tool 호출 시 → SYNTAX 에러 + retry
 
 **Plan JSON Schema** (LLM에 전달하는 필수 스키마. 구현 진행 시 추가)
 
@@ -450,6 +504,7 @@ Please fix the failing test and regenerate the diff.
           "type": { "type": "string", "enum": ["llm", "skill"] },
           "description": { "type": "string" },
           "target_files": { "type": "array", "items": { "type": "string" } },
+          "ops": { "type": "array", "items": { "type": "string", "enum": ["create", "modify", "delete", "rename"] }, "description": "이 step에서 수행하는 파일 작업 종류" },
           "skill_name": { "type": "string" },
           "skill_input": { "type": "object" }
         },
@@ -474,14 +529,16 @@ type Step struct {
     Description string   // 이 step이 하는 일 (사람이 읽을 용도)
     TargetFiles []string // 변경/읽기 대상 파일 경로 (Gate 검사 대상)
 
+    Ops         []string // "create" | "modify" | "delete" | "rename" — Gate가 deny_ops 검사에 사용
+
     // type: "skill" 전용
-    SkillName  string          // registry에서 조회할 skill 이름 (e.g. "file.read")
+    SkillName  string          // registry에서 조회할 skill 이름 (e.g. "file_read")
     SkillInput json.RawMessage // skill에 전달할 입력 JSON
 }
 ```
 - [ ] PlanGate
   - deny_paths: 지정 경로/패턴 대상 plan → 거부
-  - deny_ops: 금지 작업(delete, rename 등) → on_violation(abort/warn) 정책
+  - deny_ops: Step.Ops와 매칭하여 금지 작업(delete, rename 등) 감지 → on_violation(abort/warn) 정책. Phase 2에서 실제 diff 헤더(`deleted file mode`, `rename from/to`)와 교차 검증
   - 보안: 하네스 소스 파일 대상 거부, 시스템 명령 패턴(`rm -rf`, `curl | sh`) 차단
   - Gate는 plan 내용을 신뢰하지 않는 전제로 동작
 
@@ -614,11 +671,12 @@ type Step struct {
 
 - [ ] Skill 인터페이스 + Registry
   - Register/Get/Execute. 중복 등록 → 패닉
+  - **이름 규칙**: 내부 registry는 underscore 통일 (`file_read`, `shell_run`). LLM에 전달하는 tool name과 동일하게 유지하여 매핑 불필요
   - Input/Output 스키마 검증. 실패 → PERMANENT (retry 없이 abort)
   - Idempotent: false인 skill 실패 → retry 금지
-- [ ] `file.read`
+- [ ] `file_read`
   - 멱등. 파일 읽기. `deny_context_paths` 매칭 → PERMANENT. 미존재 → PERMANENT
-- [ ] `shell.run`
+- [ ] `shell_run`
   - 비멱등. allow-list: config `skill.shell_allow_list` 기반 (deny-by-default). 비허용 명령 → PERMANENT
   - 실행 방식 2경로:
     - **Direct exec**: 알려진 도구(`go`, `git` 등)는 `exec.Command`로 직접 실행 — 쉘 안 거침, OS 무관, injection 위험 없음
@@ -693,9 +751,11 @@ type Step struct {
   - 0 = 해당 제한 비활성화. 대기 중 ctx cancel → 즉시 에러
   - 429 피드백: APIClient가 429 수신 → `OnThrottle(retryAfter)` → 해당 기간 새 요청 대기
 - [ ] 모델 분리
-  - plan 생성 = config `api.model`, diff 생성 = config `api.diff_model` (미설정 시 동일)
+  - plan 생성 = config `api.model` + `api.context_window`, diff 생성 = config `api.diff_model` + `api.diff_context_window` (미설정 시 각각 api.model, api.context_window 사용)
 - [ ] Prompt Caching
-  - Claude API `cache_control` 파라미터 사용. 캐시 적중 시 input_tokens 과금 절감. 하네스 자체 캐시 없음
+  - Claude API `cache_control: {"type": "ephemeral"}` 파라미터 사용. 캐시 적중 시 input_tokens 과금 절감. 하네스 자체 캐시 없음
+  - breakpoint 배치 전략: (1) system prompt 끝 (2) context 블록 중 가장 큰 파일 내용 끝 — 최대 4개. step 간 변하지 않는 블록에 우선 배치하여 적중률 확보
+  - provider별 캐시 메커니즘이 다르므로, CallOption.CacheControl로 breakpoint 위치를 전달하고 provider가 자체 방식으로 적용
 - [ ] CH11과 책임 분리: Observability는 관측(audit), Cost Control은 제어(budget 차감). 같은 usage 데이터를 각자 목적으로 소비
 
 **테스트**: [I] timing 기록 / usage 추적 / audit 저장 / [M] budget 정책 / RPM·TPM 대기 / 모델 분리 / cache 반영
@@ -709,7 +769,7 @@ type Step struct {
 **Flow** (`internal/flow/`)
 
 - [ ] Phase 1: 초기화
-  - dirty workdir 확인: abort(즉시 에러) / stash(`git stash` → 실행 → `git stash pop`, stash 실패 → abort) / proceed(경고 후 진행)
+  - dirty workdir 확인: abort(즉시 에러) / stash(`git stash` → 실행 → `git stash pop`, stash 실패 → abort, pop conflict → stash 보존 + 에러 메시지 "git stash pop 수동 실행 필요" + exit code 1) / proceed(경고 후 진행)
   - txlog 존재 → 이전 crash 복구 (자동 rollback)
   - lock 파일 획득 (request_id 기반 중복 실행 방지)
 - [ ] Phase 2: Plan 생성
@@ -736,8 +796,9 @@ type Step struct {
 - [ ] 서브커맨드
   - `run --request "..."`: 전체 실행
   - `plan --request "..."`: Phase 2까지 (plan JSON 출력, LLM 1회)
-  - `apply --plan plan.md`: Phase 1 → plan 로드 → Phase 3~4
+  - `apply --plan plan.json`: Phase 1 → plan 로드 → Phase 3~4. 입력 파일은 Plan JSON Schema와 동일한 JSON 파일 (`plan` 서브커맨드 출력을 그대로 사용)
 - [ ] 공통 플래그: `--config`, `--dry-run`(diff 출력만, 파일 쓰기 없음), `--verbose`, `--override-policy`, `--force`
+  - `--dry-run`: Apply/Format/Verify 스킵, LLM 호출 + tool use 루프는 정상 실행 (읽기 tool은 실행, 쓰기 결과는 파일에 반영 안 함). 최종 diff만 stdout 출력
 - [ ] Graceful Shutdown
   - `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`. Windows는 SIGTERM 미지원이므로 `os.Interrupt`(Ctrl+C)만 유효
   - Apply 중 → 완료/rollback 후 종료
