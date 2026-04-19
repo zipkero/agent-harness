@@ -1,57 +1,51 @@
-# agent-harness
+# agent-harness — Agent Instructions
 
-Module: `github.com/zipkero/agent-harness`
+에이전트가 이 저장소에서 작업할 때 따라야 할 규칙. 프로젝트 개요·아키텍처는 `READMD.md`, 검증 경계는 `PLAN.md`, 구현 결정값은 `IMPLEMENT.md`를 본다.
 
-## 패키지 구조
-
-| 패키지 | 역할 |
-|---|---|
-| `cmd/agent-harness/` | CLI 진입점 |
-| `internal/config/` | config.yaml 로드 + 검증 |
-| `internal/harness/` | HarnessError, 공용 타입 |
-| `internal/api/` | LLMProvider 인터페이스 + 공통 타입 |
-| `internal/api/claude/` | Claude API 구현체 |
-| `internal/parser/` | LLM 응답에서 diff/fullfile 추출 |
-| `internal/context/` | 프롬프트 조립 + 토큰 축소 |
-| `internal/plan/` | Plan 생성 + PlanGate |
-| `internal/apply/` | diff 적용 + atomic write + rollback |
-| `internal/apply/atomic/` | atomic file write |
-| `internal/verify/` | go test/vet + RetryState |
-| `internal/hook/` | pre/post hook 정책 |
-| `internal/skill/` | Skill 인터페이스 + Registry (file_read, shell_run) |
-| `internal/tool/` | ToolExecutor (tool_use 블록 실행) |
-| `internal/observe/` | Recorder (timing, span) |
-| `internal/cost/` | SessionBudget + RateLimiter |
-| `internal/token/` | 토큰 카운팅 (근사 함수, CJK 보정, Calibrator) |
-| `internal/flow/` | 전체 파이프라인 오케스트레이션 |
-| `testdata/` | 테스트용 프로젝트, config, API fixture, diff fixture |
-
-## 에러 규칙
-
-- 모든 에러는 `HarnessError(Class + Stage)` — Class: TRANSIENT/PERMANENT/SYNTAX
-- 에러 생성은 발생 지점에서만, 상위 레이어는 그대로 전파 (재래핑 금지)
-- `errors.Is/As` 체인 지원
-
-## 공통 규칙
+## Coding Rules
 
 - 모든 공개 함수 첫 인자 `context.Context`
-- 경로: 내부 `/` 통일, 파일 접근 시 OS 변환
-- 로깅: `slog` 사용, `--verbose` → Debug 레벨
-- `.harness/`: txlog, audit, lock, backup 저장 (프로젝트 루트 하위)
-- 프로젝트 루트: `--root` 플래그 → `.git/` 상위 탐색 → CWD
+- 모든 에러는 `HarnessError(Class + Stage)` 형태. Class는 TRANSIENT / PERMANENT / SYNTAX 중 하나
+- 에러는 발생 지점에서만 생성한다. 상위 레이어는 그대로 전파 — 재래핑 금지
+- `errors.Is` / `errors.As` 체인을 지원하도록 wrap 한다
+- 경로는 내부에서 `/` 기준으로 통일하고, 파일 접근 시점에만 OS 경로로 변환
+- 로깅은 `slog`. `--verbose` 플래그가 켜지면 Debug 레벨
 
-## 테스트 태그
+## Test Conventions
+
+테스트 함수명/파일 주석에 다음 태그를 명시한다:
 
 - `[U]` Unit — 외부 의존 없음
 - `[M]` Mock — httptest 등 fake 의존
-- `[I]` Integration — 실제 파일/프로세스
+- `[I]` Integration — 실제 파일/프로세스 사용
 
-## 의존성 정책
+## Dependency Policy
 
-PLAN.md 외부 의존성 테이블에 등록된 패키지만 사용. 새 의존성 추가 시 사유 필요.
+`IMPLEMENT.md`의 외부 의존성 목록에 등록된 패키지만 사용한다. 새 의존성을 추가하려면 사유를 `IMPLEMENT.md`에 기재한 뒤 등록한다.
 
-## Phase 진행 규칙
+## Document Chain
 
-- PLAN.md 체크리스트를 한 개씩 순서대로 진행
-- 이전 체크리스트 항목 완료 전 다음 항목 진행 금지
-- 각 Phase 마일스톤의 검증 기준 통과 후 다음 Phase 진행
+문서 책임 분리:
+
+| 문서 | 역할 |
+|---|---|
+| `READMD.md` | 프로젝트 개요, 설계 철학, 불변 모델(state machine / 에러 분류 체계 등) |
+| `PLAN.md` | 완성 판정의 검증 경계 (무엇이 동작해야 하고 어떻게 관측하는가) |
+| `IMPLEMENT.md` | 구현 구조 + 결정값 (config 스키마, 임계값, 템플릿) |
+| 코드 | 최종 진실 |
+
+진행 순서: `READMD.md` 숙지 → `PLAN.md`의 Task 단위로 구현 → verifier 승인 시 해당 Task 앞에 `✓` 마커 prepend.
+
+## Phase Progression
+
+- `PLAN.md`의 Task 를 Phase 내에서 한 개씩 순서대로 진행
+- 각 Phase 첫 Task("회귀 검증")가 통과해야 그 Phase의 나머지 Task 진행
+- Phase 통합 검증이 `✓` 를 받기 전까지 다음 Phase 진입 금지
+- verifier reject 시 해당 Task의 `✓` 를 제거 (있으면) 후 재작업
+
+## Scope Discipline
+
+- 요청된 파일·섹션 외 수정 금지
+- 리팩토링·테스트 보강은 별도 요청 시에만
+- 새로 만들기보다 기존 파일 수정 우선
+- 필요해 보여도 요청 범위를 벗어난 변경은 제안만, 적용은 하지 않음
